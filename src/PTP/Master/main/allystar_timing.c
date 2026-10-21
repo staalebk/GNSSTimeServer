@@ -749,6 +749,30 @@ static void allystar_timing_sequence_task(void *pv)
 
     /* -------- Phase A: send config that doesn't need a fix -------- */
 
+    /* Vendor-supplied 5 Hz navigation/NMEA rate command (06 42).
+     * RAM configuration only: no flash-save or CFG-PPS writes. ACK alone is
+     * insufficient; the master requires observed .400-.600 messages before
+     * it can establish the absolute PPS reference. */
+    {
+        const uint8_t rate_5hz[20] = {
+            0x00, 0x05, 0x38, 0x00, 0xC8, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x00, 0x00
+        };
+        if (!send_cfg_with_ack(0x42, rate_5hz, sizeof(rate_5hz))) {
+            fail_step("CFG-NMEA-RATE-5HZ"); vTaskDelete(NULL); return;
+        }
+        /* Enable both time-bearing messages at the navigation update rate. */
+        const uint8_t ids[] = {0x05, 0x07}; /* RMC, ZDA */
+        for (unsigned i = 0; i < sizeof(ids); ++i) {
+            const uint8_t msg[3] = {0xF0, ids[i], 0x01};
+            if (!send_cfg_with_ack(0x01, msg, sizeof(msg))) {
+                fail_step("CFG-MSG-TIME-5HZ"); vTaskDelete(NULL); return;
+            }
+        }
+        ESP_LOGI(TAG, "5 Hz rate ACKed; RMC/ZDA enabled; awaiting mid-second PPS labels");
+    }
+
 /* CFG-NAVSAT */
     {
         uint8_t p[4];

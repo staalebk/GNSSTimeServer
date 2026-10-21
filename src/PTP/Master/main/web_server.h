@@ -118,6 +118,7 @@ static size_t web_append(char *buf, size_t cap, size_t off, const char *fmt, ...
  * directly because this header is included from main.c (single TU). */
 
 static const char *WEB_TAG = "WEB";
+#include "web_history.h"
 
 /* ----------------------------------------------------------------------------
  *  GET /  --  serves the embedded HTML page
@@ -290,8 +291,8 @@ static esp_err_t status_handler(httpd_req_t *req)
     }
 
     /* ---------- build JSON ---------- */
-    /* 8 KB is plenty: ~2.5 KB scalars + ~13 tasks * ~120 B = ~4 KB worst case */
-    const size_t BUF_SZ = 8192;
+    /* Scalars, up to 40 tasks and 192 bounded satellite observations. */
+    const size_t BUF_SZ = 32768;
     char *buf = (char *)malloc(BUF_SZ);
     if (!buf)
     {
@@ -470,7 +471,55 @@ static esp_err_t status_handler(httpd_req_t *req)
         first = false;
     }
 
-    off = web_append(buf, BUF_SZ, off, "]}");
+    portENTER_CRITICAL(&g_gnss_sig_lock);
+    unsigned sv_used = g_gnss_sv_used;
+    int64_t sig_age = g_gnss_sig_last_update_ms ? now_ms - g_gnss_sig_last_update_ms : -1;
+    int64_t used_age = g_gga_last_update_ms ? now_ms - g_gga_last_update_ms : -1;
+    unsigned sv_view = g_gnss_sv_in_view;
+    portEXIT_CRITICAL(&g_gnss_sig_lock);
+    taskENTER_CRITICAL(&g_gnss_spinlock);
+    time_t sky_utc = g_gnss_seconds;
+    int64_t sentence_us = g_gnss_sentence_rx_us;
+    const char *sentence_source = g_gnss_sentence_source;
+    taskEXIT_CRITICAL(&g_gnss_spinlock);
+    off = web_append(buf, BUF_SZ, off,
+        "],\"gnss_epoch\":%lld,\"sentence_source\":\"%s\",\"sentence_age_ms\":%lld,"
+        "\"pps_reference_valid\":%s,\"satellites_used\":%u,\"satellites_visible\":%u,"
+        "\"signal_age_ms\":%lld,\"used_age_ms\":%lld,\"satellites\":[",
+        (long long)sky_utc, sentence_source,
+        (long long)(sentence_us ? (esp_timer_get_time() - sentence_us) / 1000 : -1),
+        g_gnss_pps_valid ? "true" : "false", sv_used, sv_view,
+        (long long)sig_age, (long long)used_age);
+    first = true;
+    static const char *const systems[] = {"GPS", "GLONASS", "Galileo", "BeiDou", "Combined", "Other"};
+    for (int t = 0; t < GSV_TALKER_COUNT; t++) {
+        for (int i = 0; i < GSV_MAX_SVS_PER_TALKER; i++) {
+            portENTER_CRITICAL(&g_gnss_sig_lock);
+            web_satellite_t sat = g_web_sats[t][i];
+            portEXIT_CRITICAL(&g_gnss_sig_lock);
+            if (!sat.seen_ms || now_ms - sat.seen_ms > 10000) continue;
+            off = web_append(buf, BUF_SZ, off,
+                "%s{\"system\":\"%s\",\"prn\":%u,\"elevation\":%d,\"azimuth\":%d,\"cn0\":%d}",
+                first ? "" : ",", systems[t], (unsigned)sat.prn,
+                sat.elevation, sat.azimuth, sat.cn0);
+            first = false;
+        }
+    }
+    /* Reuse the PPS task's PHC/monotonic anchor. No hardware clock access
+     * from HTTP; this extrapolation is only for the browser's millisecond clock. */
+    taskENTER_CRITICAL(&g_servo_spinlock);
+    uint64_t clock_anchor_ns = g_last_pps_phc_ns;
+    int64_t clock_anchor_us = g_servo_sample_us;
+    bool clock_ready = g_phc_stepped;
+    taskEXIT_CRITICAL(&g_servo_spinlock);
+    int64_t clock_age_us = esp_timer_get_time() - clock_anchor_us;
+    int64_t utc_ms = (int64_t)(clock_anchor_ns / 1000000ULL) -
+                     (int64_t)tai_off * 1000 + clock_age_us / 1000;
+    if (clock_ready && clock_anchor_us && clock_age_us >= 0 && clock_age_us <= 5000000LL &&
+        utc_ms > 1577836800000LL)
+        off = web_append(buf, BUF_SZ, off, "],\"clock_utc_ms\":%lld}", (long long)utc_ms);
+    else
+        off = web_append(buf, BUF_SZ, off, "],\"clock_utc_ms\":null}");
 
     free(tarr);
 
@@ -654,6 +703,7 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
  * --------------------------------------------------------------------------- */
 static httpd_handle_t web_server_start(void)
 {
+    history_start();
     httpd_handle_t server = NULL;
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
 
@@ -714,6 +764,8 @@ static httpd_handle_t web_server_start(void)
         .user_ctx = NULL,
     };
 
+    static const httpd_uri_t uri_history = {.uri = "/api/history", .method = HTTP_GET, .handler = history_handler};
+    httpd_register_uri_handler(server, &uri_history);
     httpd_register_uri_handler(server, &uri_root);
     httpd_register_uri_handler(server, &uri_status);
     httpd_register_uri_handler(server, &uri_health);

@@ -196,6 +196,14 @@ Libraries:
   mkfrey/u8g2-hal-esp-idf @ ^v3-compat
 ```
 
+### Running the PTP grandmaster without a screen
+
+The OLED is disabled by default (`OLED_ENABLED 0` in `Master/main/main.c`). This skips display initialization and the display task, avoiding I2C errors when no screen is connected. The button (including long-press WiFi control), LEDs, web dashboard, and timing tasks remain available.
+
+To enable a connected SH1106 display, set `OLED_ENABLED` to `1`, then rebuild and flash the ESP-IDF Master project. The root `platformio.ini` builds the separate NTP/RDATE firmware.
+
+The `GNSS_SIG: no GSV data received yet` warning is separate from the display; disabling the OLED does not change GNSS message reception.
+
 > [!IMPORTANT]
 > On its first boot in a new location, the PTP grandmaster spends a few minutes on a **TAU1201 position survey** before timing-mode engages, screen 5 shows progress. This is part of the timing mode process activation, it will compute it's current location during this window and then revert to timing only calculation.
 
@@ -280,3 +288,5 @@ The NTP/RDATE server stands on the shoulders of [w8bh.net](http://w8bh.net/avr/c
 [!["Buy Me A Coffee"](https://www.buymeacoffee.com/assets/img/custom_images/orange_img.png)](https://www.buymeacoffee.com/cristmon)
 
 73 📻
+
+The Master overview includes timing history below Time reference: 60 seconds at 1-second resolution, one hour at 1-minute resolution, and 24 hours at 15-minute resolution. Each interval retains the worst sampled servo status and the minimum/maximum applied frequency adjustment (ppb). Sampling runs on the device every second, even with no browser connected. History is kept in RAM, resets at reboot, and is available through GET /api/history; empty intervals appear as gaps. Status severity increases from Locked to Acquiring, Holdover, No link, and Fault/unknown. The newest interval is partial.

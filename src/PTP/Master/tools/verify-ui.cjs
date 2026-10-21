@@ -1,0 +1,44 @@
+const fs=require('fs'),vm=require('vm'),assert=require('assert');
+const html=fs.readFileSync('src/PTP/Master/main/index.html','utf8');
+const ids=[...html.matchAll(/id="([^"]+)"/g)].map(m=>m[1]);
+assert.equal(new Set(ids).size,ids.length,'unique IDs');
+const nodes={};
+function element(){return {textContent:'',style:{},classList:{add(){},remove(){}},addEventListener(){},setAttribute(){},appendChild(v){this.firstChild ||=v;},replaceChildren(){this.firstChild=null;},getContext(){return new Proxy({}, {get:()=>()=>{}});}};}
+ids.forEach(id=>nodes[id]=element());
+let js=html.match(/<script>([\s\S]*?)<\/script>/)[1].replace('" SP_STR(HEALTH_POLL_INTERVAL_MS) "','1000');
+js=js.replace(/\npoll\(\);\nsetInterval\(poll, 5000\);/,'');
+let monotonicMs = 100;
+const ctx=vm.createContext({performance:{now:()=>monotonicMs},document:{getElementById:id=>{assert(nodes[id],id);return nodes[id];},createElement:element},console,setInterval:()=>1,clearInterval(){},fetch:async()=>({ok:true,json:async()=>({})})});
+vm.runInContext(js,ctx);
+vm.runInContext('render({tasks:[]})',ctx);
+assert.equal(nodes.clockUtc.textContent,'--:--:--.-');
+vm.runInContext(`render({gnss_fix:true,clock_utc_ms:1792584000123,gnss_epoch:1792584000,tai_offset:37,signal_age_ms:100,used_age_ms:100,satellites_used:4,satellites_visible:8,satellites:[{system:'GPS',prn:1,elevation:45,azimuth:180,cn0:40}],tasks:[]},25);showPanel(true);`,ctx);
+assert.equal(nodes.statusPanel.hidden,true);
+assert.equal(nodes.systemPanel.hidden,false);
+assert.equal(nodes.satSummary.textContent,'4 used / 8 in view');
+assert(nodes.clockDate.textContent.includes('UTC'));
+assert(nodes.clockUtc.textContent.endsWith('.1'), 'fraction and latency correction');
+monotonicMs += 1234;
+vm.runInContext('tickClock()',ctx);
+assert.equal(nodes.clockUtc.textContent,new Date(1792584000123+25+1234).toISOString().slice(11,21),'clock advances without polling');
+// Verify date rollover and expiry using monotonic elapsed time.
+vm.runInContext(`renderReference({clock_utc_ms:Date.parse('2026-10-21T23:59:59.900Z')})`,ctx);
+monotonicMs += 200;
+vm.runInContext('tickClock()',ctx);
+assert.equal(nodes.clockUtc.textContent,'00:00:00.1');
+assert(nodes.clockDate.textContent.startsWith('2026-10-22'));
+monotonicMs += 15000;
+vm.runInContext('tickClock()',ctx);
+assert.equal(nodes.clockUtc.textContent,'--:--:--.-');
+vm.runInContext('render({gnss_fix:false,signal_age_ms:15000,used_age_ms:15000,tasks:[]});showPanel(false);',ctx);
+assert.equal(nodes.clockUtc.textContent,'--:--:--.-');
+assert.equal(nodes.satSummary.textContent,'— used / — in view');
+assert.equal(nodes.systemPanel.hidden,true);
+console.log('PASS: JavaScript syntax, all render IDs, missing/live/stale data, satellite rendering, panel switching');
+
+vm.runInContext('renderHistory({ranges:[{step_s:1,samples:[null,[0,-100,-90],[4,-120,-80]]},{step_s:60,samples:[[2,10,10]]},{step_s:900,samples:[null]}]})',ctx);
+assert(nodes.historyStatus0.innerHTML.includes('#bd93f9'),'worst status color');
+assert(nodes.historyFreq0.innerHTML.includes('-120 ppb'),'frequency minimum');
+assert(nodes.historyFreq0.innerHTML.includes('-80 ppb'),'frequency maximum');
+assert(!nodes.historyFreq2.innerHTML.includes('NaN'),'empty history');
+console.log('PASS: history gaps, severity colors, frequency extremes and empty range');

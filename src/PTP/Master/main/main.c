@@ -107,6 +107,17 @@
 
 #include "driver/uart.h"
 #include "driver/gpio.h"
+#include "driver/gpio_etm.h"
+#include "driver/gptimer.h"
+#include "driver/gptimer_etm.h"
+#include "esp_etm.h"
+#include "pps_fit.h"
+#include "pps_gate.h"
+#include "hal/timer_ll.h"
+#include "esp_private/etm_interface.h"
+#include "nvs.h"
+#include "nvs_flash.h"
+#include "soc/emac_ptp_struct.h"
 #include "esp_rom_sys.h"
 
 #include "u8g2_esp32_hal.h"
@@ -137,9 +148,9 @@
  * Fallback static IP — used if DHCP doesn't reply in time. Pick a private
  * subnet you don't use elsewhere. */
 #define DHCP_FALLBACK_TIMEOUT_MS 30000 /* wait up to 30 s for DHCP */
-#define STATIC_IP_ADDR ESP_IP4TOADDR(192, 168, 5, 2)
+#define STATIC_IP_ADDR ESP_IP4TOADDR(192, 168, 1, 27)
 #define STATIC_IP_NETMASK ESP_IP4TOADDR(255, 255, 255, 0)
-#define STATIC_IP_GATEWAY ESP_IP4TOADDR(192, 168, 5, 1)
+#define STATIC_IP_GATEWAY ESP_IP4TOADDR(192, 168, 1, 1)
 
 /* ─── PTP protocol (IEEE 1588-2008) ───
  * Sync cadence is 1 Hz, Announce 0.5 Hz. ptp_tx_task ticks at
@@ -197,10 +208,39 @@ _Static_assert(PTP_ANNOUNCE_DIV >= 1,
 #define SLAVE_TIMEOUT_MS 30000 /* a slave is "active" if seen <30s ago */
 
 /* ─── GNSS UART + PPS pins ─── */
+/* Device hostname: use lowercase letters, digits and hyphens (1-31 chars).
+ * Give each device a unique name. Use "" for the MAC-derived name. */
+#define DEVICE_HOSTNAME "TAG-ESP32-PTP-MASTER"
+_Static_assert(sizeof(DEVICE_HOSTNAME) <= MAC_HOSTNAME_BUF_LEN,
+               "DEVICE_HOSTNAME must be at most 31 characters");
+
 #define GNSS_UART_NUM UART_NUM_1
 #define GNSS_TX_PIN 33
 #define GNSS_RX_PIN 32
 #define PPS_GPIO 20
+
+/* Hardware PPS capture diagnostics. Keep correction off until PPS_CAPTURE
+ * logs have been checked on the board. No wiring change is required. */
+#define PPS_CAPTURE_APPLY_CORRECTION 1
+#define PPS_CAPTURE_DIRECT_PHC 1 /* Raw register snapshot in the minimal ISR. */
+#define GNSS_TIME_ASSOC_LOG 0 /* Full sentence logging is noisy at 5 Hz. */
+/* PLL_F80M is 80 MHz; the P4 timer prescaler must be at least 2. */
+#define PPS_CAPTURE_RESOLUTION_HZ 40000000UL
+_Static_assert(PPS_CAPTURE_RESOLUTION_HZ > 0 &&
+               PPS_CAPTURE_RESOLUTION_HZ <= 40000000UL,
+               "P4 GPTimer requires divider >= 2 from the 80 MHz source");
+#define PPS_CAPTURE_MAX_DELAY_NS 100000ULL
+#define PPS_CAPTURE_MAX_READ_WINDOW_NS 20000ULL
+#define SERVO_MAX_READ_WINDOW_NS 5000ULL
+#define TIMING_LOG_INTERVAL 10U
+#define PPS_CADENCE_GATE_US 10U /* Tighten only after prediction-error validation. */
+#define PPS_LABEL_MAX_COAST_SECONDS 5U /* Require fresh UTC confirmation after this gap. */
+#define PPS_COMPARE_FITS 1 /* Identical acquisition samples, raw vs corrected. */
+#define FREQUENCY_PERSIST_WRITES_ENABLED 0 /* Resume after capture-path validation. */
+#define FREQUENCY_SAVE_SAMPLES 21U /* 30-second samples spanning >=10 minutes */
+#define FREQUENCY_SAVE_SPREAD_PPB 200
+#define FREQUENCY_SAVE_CHANGE_PPB 100
+#define FREQUENCY_SAVE_INTERVAL_US 21600000000LL /* six hours per boot */
 
 /* ─── Holdover ─── */
 #define HOLDOVER_TIMEOUT_SEC 5
@@ -258,31 +298,10 @@ _Static_assert(PTP_ANNOUNCE_DIV >= 1,
  * to prevent runaway, not a tuning parameter. */
 #define SERVO_FREQ_LIMIT_PPB 500000.0
 
-/* ─── Servo lock-acquisition criteria ───
- *
- * Three conditions must all hold for LOCK_THRESHOLD consecutive samples
- * before SERVO_LOCKED is declared:
- *   1. |offset|                < LOCK_OFFSET_NS        (phase converged)
- *   2. |offset - prev_offset|  < LOCK_FREQ_DELTA_NS    (frequency converged)
- *   3. Count of (1)&(2) being true ≥ LOCK_THRESHOLD    (sustained)
- *
- * Phase 5 µs: prior good runs showed steady-state ±500 ns offset. A 5 µs
- * gate guarantees we don't declare lock while the servo is still
- * mid-correction, but is loose enough that normal sample-to-sample PPS
- * jitter doesn't bounce us out.
- *
- * Frequency 2 µs delta: PI servo at steady state moves the filtered
- * offset by under 1 µs/sample. A 2 µs gate excludes the settling phase
- * (where consecutive samples may differ by 100+ µs).
- *
- * Threshold LOCK_THRESHOLD = 8, applied as `stable_count > LOCK_THRESHOLD` in
- * servo_task, so lock is actually declared on the 9th consecutive sample
- * (≈9 seconds): with both phase + freq gated, this is solid evidence of
- * convergence without being painfully slow. */
-#define LOCK_THRESHOLD 8
+/* Acquisition lock: two independent fit windows with phase <5 us,
+ * residual drift <100 ppb, p90 residual <=5 us and >=24 clean samples.
+ * Timing quality is checked separately from GNSS second association. */
 #define LOCK_OFFSET_NS 5000LL
-#define LOCK_FREQ_DELTA_NS 2000LL
-
 /* ACQUIRING sanity rail. A pre-lock offset beyond this bound cannot come
  * from normal acquisition (worst legitimate case is ~2.5 s: coarse-step
  * granularity plus a stale sentence_offset); it means the PHC or the GNSS
@@ -360,6 +379,10 @@ _Static_assert(PTP_ANNOUNCE_DIV >= 1,
 #define PPS_LED_ON_MS 50      // how long the pulse stays lit (tunable)
 
 /* ─── OLED (I2C SH1106 128x64) + screen-cycle button ─── */
+#ifndef OLED_ENABLED
+#define OLED_ENABLED 0 // Set to 1 when an SH1106 display is connected.
+#endif
+
 #define PIN_SDA 7
 #define PIN_SCL 8
 
@@ -546,6 +569,7 @@ static _Atomic bool g_l2tap_ready = false;
  * present. PTP packet I/O (rx/tx tasks) gates on g_link_up instead, since that
  * genuinely needs a peer on the wire. */
 static _Atomic bool g_phc_ready = false;
+static _Atomic bool g_ptp_service_ready = false;
 /* Set true while emac_restart_preserve_phc() is tearing down / rebuilding the
  * MAC. servo_task must not issue esp_eth_ioctl PHC commands while this is set,
  * or it races the restart's PHC write on the other core. */
@@ -647,10 +671,120 @@ static uint32_t ptp_sync_jitter_stats(int64_t *out_min, int64_t *out_max,
 
 /* ─── GNSS time + PPS edge state ─── */
 static volatile uint64_t g_last_pps_phc_ns = 0;
+static bool g_servo_sample_clean;
+static int64_t g_servo_sample_us;
+static uint64_t g_servo_raw_ns, g_servo_candidate_ns;
 static time_t g_gnss_seconds = 0;
-static bool g_gnss_valid = false;
-static int g_utc_offset = 37; // TAI - UTC (update if leap second changes)
+static int64_t g_gnss_sentence_rx_us = 0;
+static const char *g_gnss_sentence_source = "none";
 static portMUX_TYPE g_gnss_spinlock = portMUX_INITIALIZER_UNLOCKED;
+/* Only mid-second epochs may label the next PPS. Keep a short queue so
+ * messages parsed after an edge cannot hide the pre-edge candidate. */
+typedef struct {
+    time_t utc;
+    int fraction_ms;
+    int64_t rx_us;
+} gnss_pps_label_t;
+static gnss_pps_label_t g_pps_labels[8];
+static unsigned g_pps_label_write;
+static bool g_gnss_valid = false;
+typedef struct {
+    int64_t rx_us;
+    char time_field[16];
+    char source[4];
+    bool checksum_ok, parsed, fix_valid;
+    uint32_t buffered_bytes;
+} midsecond_rx_debug_t;
+static midsecond_rx_debug_t g_midsecond_rx[16];
+static uint32_t g_midsecond_rx_count, g_midsecond_queue_overwrites;
+typedef struct {
+    bool pending;
+    uint32_t seq, rx_count, queue_overwrites, replaced;
+    int64_t edge_us;
+    gnss_pps_label_t queue[8];
+    midsecond_rx_debug_t rx[16];
+} midsecond_dump_t;
+static midsecond_dump_t g_midsecond_dump;
+static portMUX_TYPE g_midsecond_dump_lock = portMUX_INITIALIZER_UNLOCKED;
+
+static void midsecond_report_dump(void)
+{
+    static midsecond_dump_t dump; /* low-priority report task only */
+    portENTER_CRITICAL(&g_midsecond_dump_lock);
+    dump = g_midsecond_dump;
+    g_midsecond_dump.pending = false;
+    portEXIT_CRITICAL(&g_midsecond_dump_lock);
+    if (!dump.pending) return;
+    ESP_LOGW("MID_DEBUG", "missing label seq=%lu edge_us=%lld rx_total=%lu queue_overwrites=%lu snapshots_suppressed=%lu",
+             (unsigned long)dump.seq, (long long)dump.edge_us, (unsigned long)dump.rx_count,
+             (unsigned long)dump.queue_overwrites, (unsigned long)dump.replaced);
+    for (unsigned i = 0; i < 8; ++i) {
+        gnss_pps_label_t q = dump.queue[i];
+        if (q.rx_us)
+            ESP_LOGI("MID_DEBUG", "queue slot=%u utc=%lld frac=%d age_us=%lld",
+                     i, (long long)q.utc, q.fraction_ms, (long long)(dump.edge_us - q.rx_us));
+    }
+    unsigned n = dump.rx_count < 16 ? dump.rx_count : 16;
+    for (unsigned i = 0; i < n; ++i) {
+        midsecond_rx_debug_t r = dump.rx[(dump.rx_count - n + i) % 16];
+        ESP_LOGI("MID_DEBUG", "%s time=%s rx_us=%lld age_us=%lld checksum=%d parsed=%d fix=%d buffered=%lu",
+                 r.source, r.time_field, (long long)r.rx_us, (long long)(dump.edge_us - r.rx_us),
+                 r.checksum_ok, r.parsed, r.fix_valid, (unsigned long)r.buffered_bytes);
+    }
+}
+
+/* UART-task diagnostics only. Keep the last time-bearing sentences, including
+ * bad checksums and parser failures, without logging every 5 Hz message. */
+static void midsecond_record_rx(const char *line, int64_t rx_us, bool checksum_ok,
+                                bool parsed, size_t buffered_bytes)
+{
+    if (strlen(line) < 7 || line[0] != '$' ||
+        (memcmp(line + 3, "RMC", 3) && memcmp(line + 3, "ZDA", 3))) return;
+    midsecond_rx_debug_t entry = {.rx_us = rx_us, .checksum_ok = checksum_ok,
+        .parsed = parsed, .buffered_bytes = buffered_bytes};
+    memcpy(entry.source, line + 3, 3);
+    const char *start = strchr(line, ',');
+    if (start) {
+        ++start;
+        size_t n = strcspn(start, ",\r\n");
+        if (n >= sizeof(entry.time_field)) n = sizeof(entry.time_field) - 1;
+        memcpy(entry.time_field, start, n);
+    }
+    taskENTER_CRITICAL(&g_gnss_spinlock);
+    entry.fix_valid = g_gnss_valid;
+    g_midsecond_rx[g_midsecond_rx_count++ % 16] = entry;
+    taskEXIT_CRITICAL(&g_gnss_spinlock);
+}
+
+static void gnss_queue_pps_label(const char *line, time_t utc, int64_t rx_us)
+{
+    const char *field = strchr(line, ',');
+    if (!field || strlen(++field) < 7 || field[6] != '.')
+        return;
+    int ms = 0;
+    int scale = 100;
+    const char *p = field + 7;
+    if (*p < '0' || *p > '9')
+        return;
+    while (*p >= '0' && *p <= '9')
+    {
+        if (scale)
+        {
+            ms += (*p - '0') * scale;
+            scale /= 10;
+        }
+        ++p;
+    }
+    if (*p != ',' || ms < 400 || ms > 600)
+        return;
+    taskENTER_CRITICAL(&g_gnss_spinlock);
+    if (g_pps_labels[g_pps_label_write % 8].rx_us)
+        g_midsecond_queue_overwrites++;
+    g_pps_labels[g_pps_label_write++ % 8] =
+        (gnss_pps_label_t){.utc = utc, .fraction_ms = ms, .rx_us = rx_us};
+    taskEXIT_CRITICAL(&g_gnss_spinlock);
+}
+static int g_utc_offset = 37; // TAI - UTC (update if leap second changes)
 
 /* ISR-captured PPS PHC timestamp (sampled inside the PPS ISR).
  * Written by pps_isr_handler, read by pps_task. On the dual-core P4 these can
@@ -659,8 +793,121 @@ static portMUX_TYPE g_gnss_spinlock = portMUX_INITIALIZER_UNLOCKED;
 static portMUX_TYPE g_pps_capture_lock = portMUX_INITIALIZER_UNLOCKED;
 static uint64_t g_pps_capture_ns = 0;
 static uint32_t g_pps_capture_seq = 0;
+/* Cadence state is PPS-task-owned; reporting reads a protected copy. */
+static pps_gate_t g_pps_gate, g_pps_gate_report;
+static _Atomic uint32_t g_pps_calibrated_hz = PPS_CAPTURE_RESOLUTION_HZ;
+/* Protected by g_pps_capture_lock; drained by the 30-second report. */
+static uint32_t g_pps_rejected_edges = 0;
 
-static SemaphoreHandle_t g_pps_sem;
+static gptimer_handle_t g_pps_timer;
+static uint32_t g_pps_timer_hz;
+static timg_dev_t *g_pps_timer_hw;
+static unsigned g_pps_timer_id;
+#define PPS_RAW_QUEUE_SIZE 32U
+_Static_assert(ATOMIC_INT_LOCK_FREE == 2, "Capture queue requires lock-free indices");
+typedef struct {
+    uint64_t edge, entry, before, after;
+    int64_t observed_us;
+    uint32_t seconds_before, subsecond, seconds_after, ctrl_before, ctrl_after;
+    unsigned attempts;
+} pps_raw_capture_t;
+static pps_raw_capture_t g_pps_raw[PPS_RAW_QUEUE_SIZE];
+static _Atomic unsigned g_pps_raw_head, g_pps_raw_tail, g_pps_raw_dropped;
+typedef struct {
+    uint64_t edge_ticks, entry_ticks, before_ticks, after_ticks;
+    uint64_t phc_ns;
+    uint64_t corrected_ns;
+    uint64_t delay_ns, read_window_ns;
+    int64_t isr_observed_us;
+    uint64_t ioctl_window_ns;
+    int64_t ioctl_difference_ns;
+    bool ioctl_compare_valid;
+    unsigned snapshot_attempts;
+    unsigned ioctl_retries;
+    bool valid;
+} pps_capture_diag_t;
+/* Published together with g_pps_capture_ns under g_pps_capture_lock. */
+static pps_capture_diag_t g_pps_diag;
+
+typedef enum {
+    LABEL_OK, LABEL_NO_FIX, LABEL_CAPTURE_INVALID, LABEL_NO_MIDSECOND,
+    LABEL_TOO_OLD, LABEL_TOO_CLOSE, LABEL_POST_EDGE, LABEL_WARMUP,
+    LABEL_UTC_SEQUENCE, LABEL_PPS_INTERVAL, LABEL_COAST, LABEL_REASON_COUNT
+} pps_label_reason_t;
+static const char *const label_reason_names[LABEL_REASON_COUNT] = {
+    "ok", "no_fix", "capture_invalid", "no_midsecond", "too_old",
+    "too_close", "post_edge", "warmup", "utc_sequence", "pps_interval", "coast"
+};
+typedef struct {
+    uint32_t reasons[LABEL_REASON_COUNT];
+    uint32_t windows[6], retry_windows[6], window_missing, quality_rejects;
+    uint32_t retry_samples, retry_reads, direct_retry_samples;
+    uint32_t paired_count;
+    uint64_t max_window_ns;
+    int64_t raw_sum_ns, candidate_sum_ns;
+} pps_timing_stats_t;
+static pps_timing_stats_t g_timing_stats;
+static portMUX_TYPE g_timing_stats_lock = portMUX_INITIALIZER_UNLOCKED;
+
+/* Called by the low-priority report task, regardless of GSV freshness. */
+static void pps_report_timing_stats(void)
+{
+    pps_timing_stats_t s;
+    pps_gate_t gate;
+    portENTER_CRITICAL(&g_pps_capture_lock);
+    gate = g_pps_gate_report;
+    portEXIT_CRITICAL(&g_pps_capture_lock);
+    uint32_t scale_hz = atomic_load(&g_pps_calibrated_hz);
+    ESP_LOGI("PPS_QUEUE", "capacity=%u dropped=%u",
+             PPS_RAW_QUEUE_SIZE, atomic_load(&g_pps_raw_dropped));
+    ESP_LOGI("PPS_GATE", "calibrated=%d ticks_per_second=%lu scale_hz=%lu gate_us=%u "
+             "accepted=%lu rejected=%lu missed_slots=%lu reacquired=%lu error_ticks=%lld max_error_ticks=%llu",
+             gate.calibrated, (unsigned long)gate.period, (unsigned long)scale_hz,
+             PPS_CADENCE_GATE_US, (unsigned long)gate.accepted, (unsigned long)gate.rejected,
+             (unsigned long)gate.missed, (unsigned long)gate.reacquired,
+             (long long)gate.last_error, (unsigned long long)gate.max_error);
+    portENTER_CRITICAL(&g_timing_stats_lock);
+    s = g_timing_stats;
+    memset(&g_timing_stats, 0, sizeof(g_timing_stats));
+    portEXIT_CRITICAL(&g_timing_stats_lock);
+    ESP_LOGI("TIMING_STATS",
+             "read_ns bins[<=4000,<=5000,<=8000,<=12000,<=20000,>20000]="
+             "%lu,%lu,%lu,%lu,%lu,%lu unavailable=%lu max=%llu "
+             "quality_rejects=%lu ioctl_retry_samples=%lu extra_reads=%lu direct_retry_samples=%lu",
+             (unsigned long)s.windows[0], (unsigned long)s.windows[1],
+             (unsigned long)s.windows[2], (unsigned long)s.windows[3],
+             (unsigned long)s.windows[4], (unsigned long)s.windows[5],
+             (unsigned long)s.window_missing, (unsigned long long)s.max_window_ns,
+             (unsigned long)s.quality_rejects, (unsigned long)s.retry_samples,
+             (unsigned long)s.retry_reads, (unsigned long)s.direct_retry_samples);
+    ESP_LOGI("TIMING_STATS", "ioctl_retry_bins=%lu,%lu,%lu,%lu,%lu,%lu (same read_ns boundaries)",
+             (unsigned long)s.retry_windows[0], (unsigned long)s.retry_windows[1],
+             (unsigned long)s.retry_windows[2], (unsigned long)s.retry_windows[3],
+             (unsigned long)s.retry_windows[4], (unsigned long)s.retry_windows[5]);
+    ESP_LOGI("TIMING_STATS",
+             "labels ok=%lu no_fix=%lu capture_invalid=%lu no_midsecond=%lu "
+             "too_old=%lu too_close=%lu post_edge=%lu warmup=%lu utc_sequence=%lu pps_interval=%lu coast=%lu",
+             (unsigned long)s.reasons[0], (unsigned long)s.reasons[1],
+             (unsigned long)s.reasons[2], (unsigned long)s.reasons[3],
+             (unsigned long)s.reasons[4], (unsigned long)s.reasons[5],
+             (unsigned long)s.reasons[6], (unsigned long)s.reasons[7],
+             (unsigned long)s.reasons[8], (unsigned long)s.reasons[9],
+             (unsigned long)s.reasons[LABEL_COAST]);
+    if (s.paired_count)
+        ESP_LOGI("TIMING_STATS", "clean_pairs=%lu raw_mean=%lld ns candidate_mean=%lld ns",
+                 (unsigned long)s.paired_count,
+                 (long long)(s.raw_sum_ns / s.paired_count),
+                 (long long)(s.candidate_sum_ns / s.paired_count));
+}
+
+static uint64_t pps_ticks_to_ns(uint64_t ticks)
+{
+    uint32_t hz = atomic_load(&g_pps_calibrated_hz);
+    /* Split the conversion to avoid overflow for the free-running counter. */
+    return (ticks / hz) * 1000000000ULL +
+           (ticks % hz) * 1000000000ULL / hz;
+}
+
 
 /* ─── Servo working state ───
  * 64-bit values shared between pps_task and servo_task are guarded by
@@ -678,6 +925,103 @@ static double g_freq_ppb = 0;
  * re-acquire: the hardware keeps its last adjustment until the next ADJ
  * write, and this mirror tracks the hardware. */
 static _Atomic int32_t g_freq_ppb_hw = 0;
+static _Atomic int32_t g_frequency_learned_ppb = 0;
+static _Atomic bool g_frequency_save_eligible = false;
+static _Atomic uint32_t g_frequency_save_epoch = 0;
+static bool g_frequency_nvs_ready;
+static bool g_frequency_saved_valid;
+static int32_t g_frequency_saved_ppb;
+
+typedef struct {
+    uint32_t magic, version;
+    int32_t ppb;
+    uint8_t mac[6], reserved[2];
+} frequency_record_t;
+
+static void frequency_seed_load(void)
+{
+    esp_err_t err = nvs_flash_init();
+    if (err != ESP_OK) {
+        ESP_LOGW("FREQ_NVS", "NVS unavailable (%s); using unseeded acquisition (no erase)", esp_err_to_name(err));
+        return;
+    }
+    g_frequency_nvs_ready = true;
+    nvs_handle_t handle;
+    err = nvs_open("ptp_freq", NVS_READONLY, &handle);
+    if (err != ESP_OK) {
+        ESP_LOGI("FREQ_NVS", "No saved frequency available (%s); learning from PPS", esp_err_to_name(err));
+        return;
+    }
+    frequency_record_t record = {0};
+    size_t size = sizeof(record);
+    err = nvs_get_blob(handle, "learned", &record, &size);
+    nvs_close(handle);
+    if (err != ESP_OK || size != sizeof(record) || record.magic != 0x50545046 ||
+        record.version != 1 || llabs((long long)record.ppb) > 100000 ||
+        memcmp(record.mac, g_src_mac, sizeof(record.mac))) {
+        ESP_LOGI("FREQ_NVS", "No valid device frequency seed; learning from PPS");
+        return;
+    }
+    int32_t ppb = record.ppb;
+    err = esp_eth_ioctl(g_eth_hndl, ETH_MAC_ESP_CMD_ADJ_PTP_TIME, &ppb);
+    if (err == ESP_OK) {
+        g_freq_ppb = ppb;
+        atomic_store(&g_freq_ppb_hw, ppb);
+        g_frequency_saved_ppb = ppb;
+        g_frequency_saved_valid = true;
+        ESP_LOGI("FREQ_NVS", "Applied saved seed %ld ppb; PPS verification still required", (long)ppb);
+    } else ESP_LOGW("FREQ_NVS", "Seed apply failed: %s", esp_err_to_name(err));
+}
+
+/* Low-priority flash writes only after ten minutes of eligible steady lock.
+ * The saved term excludes proportional/derivative phase corrections. */
+static void frequency_save_task(void *arg)
+{
+    (void)arg;
+    if (!FREQUENCY_PERSIST_WRITES_ENABLED)
+        ESP_LOGI("FREQ_NVS", "Calibration writes paused for capture comparison; saved seed loading remains enabled");
+    int64_t sum = 0, last_write_us = 0;
+    int32_t low = INT32_MAX, high = INT32_MIN;
+    unsigned samples = 0;
+    uint32_t epoch = 0;
+    while (1) {
+        vTaskDelay(pdMS_TO_TICKS(30000));
+        uint32_t current_epoch = atomic_load(&g_frequency_save_epoch);
+        if (current_epoch != epoch) {
+            epoch = current_epoch;
+            samples = 0; sum = 0; low = INT32_MAX; high = INT32_MIN;
+        }
+        if (!FREQUENCY_PERSIST_WRITES_ENABLED || !g_frequency_nvs_ready || !atomic_load(&g_frequency_save_eligible)) {
+            samples = 0; sum = 0; low = INT32_MAX; high = INT32_MIN;
+            continue;
+        }
+        int32_t ppb = atomic_load(&g_frequency_learned_ppb);
+        if (ppb < low) low = ppb;
+        if (ppb > high) high = ppb;
+        sum += ppb;
+        if (++samples < FREQUENCY_SAVE_SAMPLES) continue;
+        int32_t mean = (int32_t)(sum / samples);
+        bool stable = high - low <= FREQUENCY_SAVE_SPREAD_PPB && llabs((long long)mean) <= 100000;
+        samples = 0; sum = 0; low = INT32_MAX; high = INT32_MIN;
+        int64_t now_us = esp_timer_get_time();
+        if (!stable || (last_write_us && now_us - last_write_us < FREQUENCY_SAVE_INTERVAL_US) ||
+            (g_frequency_saved_valid && llabs((long long)mean - g_frequency_saved_ppb) < FREQUENCY_SAVE_CHANGE_PPB)) continue;
+        frequency_record_t record = {.magic = 0x50545046, .version = 1, .ppb = mean};
+        memcpy(record.mac, g_src_mac, sizeof(record.mac));
+        nvs_handle_t handle;
+        esp_err_t err = nvs_open("ptp_freq", NVS_READWRITE, &handle);
+        if (err == ESP_OK) {
+            err = nvs_set_blob(handle, "learned", &record, sizeof(record));
+            if (err == ESP_OK) err = nvs_commit(handle);
+            nvs_close(handle);
+        }
+        if (err == ESP_OK) {
+            g_frequency_saved_ppb = mean; g_frequency_saved_valid = true;
+            last_write_us = now_us;
+            ESP_LOGI("FREQ_NVS", "Saved stable frequency %ld ppb", (long)mean);
+        } else ESP_LOGW("FREQ_NVS", "Save failed: %s", esp_err_to_name(err));
+    }
+}
 static volatile int64_t g_last_offset = 0;
 static volatile uint32_t g_pps_edge_count = 0;
 
@@ -799,6 +1143,15 @@ static int64_t g_gnss_sig_last_update_ms = 0;
 /* One GSV SNR accumulator per talker (see talker_index for the mapping). */
 static gsv_acc_t g_gsv_acc[GSV_TALKER_COUNT];
 
+/* Bounded, per-PRN sky view. Multiple signal bands update the same SV.
+ * Protected by g_gnss_sig_lock; stale entries are omitted by the web API. */
+typedef struct {
+    int64_t seen_ms;
+    uint16_t prn;
+    int16_t elevation, azimuth, cn0; /* -1 means not reported */
+} web_satellite_t;
+static web_satellite_t g_web_sats[GSV_TALKER_COUNT][GSV_MAX_SVS_PER_TALKER];
+
 /* Latest receiver-reported GSV total for each talker.
  *
  * If a fresh $GNGSV combined report exists, it takes precedence over the
@@ -812,13 +1165,13 @@ static int64_t g_gsv_view_seen_ms[GSV_TALKER_COUNT] = {0};
 /* Used to prevent an old GGA count remaining displayed if GGA stops. */
 static int64_t g_gga_last_update_ms = 0;
 
-/* PPS edge-to-edge jitter tracking. Captures the receiver's raw timing
+/* PPS edge-to-edge jitter tracking. Captures measured PPS interval
  * noise BEFORE the servo processes it. pps_task pushes one sample per edge;
  * gnss_signal_task reads and zeroes the accumulators every 30 s.
  *
  * The sample is (interval_ns - 1,000,000,000): zero = perfect 1 Hz cadence,
- * non-zero = receiver PPS jitter (plus a small contribution from PHC
- * frequency error, which is sub-ppb once locked and therefore negligible).
+ * non-zero includes receiver timing noise, ISR latency variation, and PHC
+ * frequency error or time steps. It does not isolate receiver quality.
  *
  * Tracked as min/max/sum_of_abs/count rather than a ring buffer so we don't
  * burn 480 bytes of RAM and stddev arithmetic for each report. */
@@ -1021,12 +1374,13 @@ static void build_local_dataset(bmca_dataset_t *ds)
  * SECTION: EMAC PHC + PTP wire helpers
  *
  * Reading the hardware PHC clock and (de)serializing PTP wire structures.
- * emac_get_time is ISR-safe and used from the PPS ISR. l2tap_send_ptp wraps
+ * emac_get_time is a task-side helper. The PPS ISR reads registers directly.
+ * l2tap_send_ptp wraps
  * a PTP payload in an Ethernet frame and transmits it via the L2TAP fd,
  * optionally returning the hardware TX timestamp.
  * ═════════════════════════════════════════════════════════════════════════ */
 
-static IRAM_ATTR void emac_get_time(struct timespec *ts)
+static IRAM_ATTR unsigned emac_read_time(struct timespec *ts)
 {
     eth_mac_time_t t1 = {0}, t2 = {0};
 
@@ -1037,9 +1391,8 @@ static IRAM_ATTR void emac_get_time(struct timespec *ts)
      * (large) with tv_sec=M can race against tv_nsec=0 with tv_sec=M
      * (when the hardware really meant tv_sec=M+1).
      *
-     * IMPORTANT: This function is called from the PPS ISR. The
-     * ETH_MAC_ESP_CMD_G_PTP_TIME path in IDF 5.5.4 reads PHC registers
-     * directly via the HAL with no locks, so it's ISR-safe.
+     * This legacy double-read helper is now task-only. PPS capture uses
+     * one bracketed subsecond register read with task-side validation.
      */
     esp_eth_ioctl(g_eth_hndl, ETH_MAC_ESP_CMD_G_PTP_TIME, &t1);
     esp_eth_ioctl(g_eth_hndl, ETH_MAC_ESP_CMD_G_PTP_TIME, &t2);
@@ -1051,11 +1404,17 @@ static IRAM_ATTR void emac_get_time(struct timespec *ts)
         esp_eth_ioctl(g_eth_hndl, ETH_MAC_ESP_CMD_G_PTP_TIME, &t3);
         ts->tv_sec = t3.seconds;
         ts->tv_nsec = t3.nanoseconds;
-        return;
+        return 1; /* One extra ioctl read after the initial pair. */
     }
 
     ts->tv_sec = t2.seconds;
     ts->tv_nsec = t2.nanoseconds;
+    return 0;
+}
+
+static IRAM_ATTR void emac_get_time(struct timespec *ts)
+{
+    (void)emac_read_time(ts);
 }
 
 static void encode_ptp_timestamp(ptp_timestamp_t *dst, const struct timespec *src)
@@ -1411,6 +1770,7 @@ static void delay_resp_task(void *arg)
     {
         if (xQueueReceive(g_delay_resp_q, &job, portMAX_DELAY) != pdTRUE)
             continue;
+        if (!atomic_load(&g_ptp_service_ready)) continue;
 
 #if LOG_LOCAL_LEVEL >= ESP_LOG_INFO
         since_last_log++;
@@ -1452,6 +1812,7 @@ static void delay_resp_task(void *arg)
 
 static void send_sync_and_followup(void)
 {
+    if (!atomic_load(&g_ptp_service_ready)) return;
     uint16_t seq = g_sync_seq++;
     struct timespec t1 = {0};
 
@@ -1498,6 +1859,7 @@ static void send_sync_and_followup(void)
 
 static void send_announce(void)
 {
+    if (!atomic_load(&g_ptp_service_ready)) return;
     ptp_announce_msg_t ann = {0};
 
     uint8_t cc = advertised_clock_class();
@@ -1518,7 +1880,7 @@ static void send_announce(void)
      * nothing until the timescale is real. LEAP59/61 are never asserted:
      * leap-second scheduling is not available from this NMEA stream, and
      * g_utc_offset is maintained manually (see its declaration). */
-    if (locked_or_holdover)
+    if (locked_or_holdover || atomic_load(&g_ptp_service_ready))
     {
         flags |= PTP_FLAG_UTC_OFFSET_VALID;
         flags |= PTP_FLAG_PTP_TIMESCALE;
@@ -1654,12 +2016,42 @@ static int nmea_split(char *buf, char *fields[], int max_fields)
 /* ─────────────────────────────────────────────────────────────────────────
  * gnss_task helpers — protect g_gnss_seconds writes
  * ───────────────────────────────────────────────────────────────────────── */
-static bool parse_zda(const char *line)
+/* rx_us is when the UART chunk containing the newline was read, before
+ * configurator work or logging. It includes UART buffering/scheduling delay;
+ * it is not the electrical UART arrival time. Raw NMEA preserves fractions. */
+static void gnss_log_time_sentence(const char *source, const char *line,
+                                   time_t utc, int64_t rx_us, bool used)
+{
+    if (!GNSS_TIME_ASSOC_LOG)
+        return;
+    portENTER_CRITICAL(&g_pps_capture_lock);
+    uint32_t seq = g_pps_capture_seq;
+    pps_capture_diag_t diag = g_pps_diag;
+    portEXIT_CRITICAL(&g_pps_capture_lock);
+    ESP_LOGI("GNSS_ASSOC",
+             "%s rx_us=%lld utc=%lld used=%d snapshot_pps_seq=%lu "
+             "pps_isr_us=%lld rx_minus_pps_isr_us=%lld hw_edge=%llu sentence=%s",
+             source, (long long)rx_us, (long long)utc, used,
+             (unsigned long)seq, (long long)diag.isr_observed_us,
+             (long long)(seq ? rx_us - diag.isr_observed_us : 0),
+             (unsigned long long)diag.edge_ticks, line);
+}
+
+static bool parse_zda(const char *line, int64_t rx_us)
 {
     int hh, mm, ss, day, mon, year;
 
-    if (sscanf(line, "$%*2cZDA,%2d%2d%2d,%2d,%2d,%4d",
-               &hh, &mm, &ss, &day, &mon, &year) != 6)
+    /* Split fields so both hhmmss and hhmmss.fff are accepted. The previous
+     * format expected a comma immediately after integer seconds and silently
+     * rejected the TAU1201's fractional-second ZDA format. */
+    char buf[128];
+    snprintf(buf, sizeof buf, "%s", line);
+    char *fields[8];
+    int nf = nmea_split(buf, fields, 8);
+    if (nf < 5 || sscanf(fields[1], "%2d%2d%2d", &hh, &mm, &ss) != 3 ||
+        sscanf(fields[2], "%2d", &day) != 1 ||
+        sscanf(fields[3], "%2d", &mon) != 1 ||
+        sscanf(fields[4], "%4d", &year) != 1)
         return false;
 
     /* Range-check before building tm (mirrors parse_rmc). ZDA carries a
@@ -1684,16 +2076,24 @@ static bool parse_zda(const char *line)
     taskENTER_CRITICAL(&g_gnss_spinlock);
     bool fix_ok = g_gnss_valid; /* set/cleared by parse_rmc only */
     if (fix_ok)
+    {
         g_gnss_seconds = utc;
+        g_gnss_sentence_rx_us = rx_us;
+        g_gnss_sentence_source = "ZDA";
+    }
     taskEXIT_CRITICAL(&g_gnss_spinlock);
 
     if (fix_ok)
         g_last_gnss_update = time(NULL);
+    if (fix_ok)
+        gnss_queue_pps_label(line, utc, rx_us);
+
+    gnss_log_time_sentence("ZDA", line, utc, rx_us, fix_ok);
 
     return true;
 }
 
-static bool parse_rmc(const char *line)
+static bool parse_rmc(const char *line, int64_t rx_us)
 {
     char buf[128];
     strncpy(buf, line, sizeof(buf));
@@ -1764,9 +2164,13 @@ static bool parse_rmc(const char *line)
     taskENTER_CRITICAL(&g_gnss_spinlock);
     g_gnss_seconds = utc;
     g_gnss_valid = true;
+    g_gnss_sentence_rx_us = rx_us;
+    g_gnss_sentence_source = "RMC";
     taskEXIT_CRITICAL(&g_gnss_spinlock);
 
     g_last_gnss_update = time(NULL);
+    gnss_queue_pps_label(line, utc, rx_us);
+    gnss_log_time_sentence("RMC", line, utc, rx_us, true);
     return true;
 }
 
@@ -1986,6 +2390,30 @@ static bool parse_gsv(const char *line)
     g_gsv_acc[t].total_expected = total_sentences;
     g_gsv_acc[t].count = satellites_in_view;
 
+    int64_t sky_now_ms = esp_timer_get_time() / 1000;
+    portENTER_CRITICAL(&g_gnss_sig_lock);
+    for (int k = 0; k < 4 && 7 + 4 * k < nf; k++) {
+        int base = 4 + 4 * k;
+        int prn = atoi(f[base]);
+        if (prn <= 0 || prn > 999) continue;
+        int slot = -1;
+        for (int i = 0; i < GSV_MAX_SVS_PER_TALKER; i++) {
+            if (g_web_sats[t][i].prn == prn) { slot = i; break; }
+            if (slot < 0 && (!g_web_sats[t][i].seen_ms ||
+                sky_now_ms - g_web_sats[t][i].seen_ms > 10000)) slot = i;
+        }
+        if (slot < 0) continue;
+        int el = f[base+1][0] ? atoi(f[base+1]) : -1;
+        int az = f[base+2][0] ? atoi(f[base+2]) : -1;
+        int cn = f[base+3][0] ? atoi(f[base+3]) : -1;
+        g_web_sats[t][slot] = (web_satellite_t){
+            .seen_ms = sky_now_ms, .prn = prn,
+            .elevation = el >= 0 && el <= 90 ? el : -1,
+            .azimuth = az >= 0 && az <= 359 ? az : -1,
+            .cn0 = cn >= 0 && cn <= 99 ? cn : -1};
+    }
+    portEXIT_CRITICAL(&g_gnss_sig_lock);
+
     /* Collect SNR values for the existing min/avg/max diagnostics.
      * Empty SNR fields remain zero and are excluded from SNR statistics,
      * but they do not reduce the visible count taken from field 3. */
@@ -2175,49 +2603,115 @@ static bool parse_gsa(const char *line)
  * holdover, and the self-healing reject-wedge watchdog.
  * ═════════════════════════════════════════════════════════════════════════ */
 
-static void IRAM_ATTR pps_isr_handler(void *arg)
+/* The GPTimer is exclusively sampled by this ISR after initialization.
+ * No driver calls (which acquire spinlocks) may sample it elsewhere. */
+static inline __attribute__((always_inline)) uint64_t pps_raw_timer_now(void)
 {
-    /*
-     * Capture the PHC time AS CLOSE AS POSSIBLE to the PPS edge.
-     * Doing this inside the ISR (rather than in pps_task) eliminates
-     * scheduling jitter (~10–50 µs) that would otherwise be injected
-     * directly into the servo offset measurement.
-     */
-
-    /* Drop edges while emac_restart_preserve_phc() is rebuilding the MAC:
-     * esp_eth_stop/start re-initializes the PHC, so a capture landing in
-     * the ~220 ms dead window reads a just-reset counter (~0). Publishing
-     * that would hand pps_task a garbage offset sample (LOCKED absorbs it
-     * via the reject gate, but ACQUIRING would burn a sanity-rail strike
-     * on it). Losing the edge entirely is the clean outcome: pps_task sees
-     * no new capture and the servo simply skips that second. atomic_load
-     * on RV32 is a plain inlined load — ISR/IRAM-safe. */
-    if (atomic_load(&g_emac_restarting))
-        return;
-
-    struct timespec ts;
-    emac_get_time(&ts);
-
-    /* Publish ns+seq atomically w.r.t. pps_task's paired read. _ISR variant:
-     * we are in interrupt context. Critical section is a few stores long. */
-    portENTER_CRITICAL_ISR(&g_pps_capture_lock);
-    g_pps_capture_ns =
-        (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
-    g_pps_capture_seq++;
-    portEXIT_CRITICAL_ISR(&g_pps_capture_lock);
-
-    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
-    xSemaphoreGiveFromISR(g_pps_sem, &xHigherPriorityTaskWoken);
-    if (xHigherPriorityTaskWoken)
-    {
-        portYIELD_FROM_ISR();
-    }
+    timer_ll_trigger_soft_capture(g_pps_timer_hw, g_pps_timer_id);
+    return timer_ll_get_counter_value(g_pps_timer_hw, g_pps_timer_id);
 }
 
-/* ─────────────────────────────────────────────────────────────────────────
- * pps_task — waits on the PPS ISR, updates jitter tracking, computes the
- * GNSS-time target for the servo, and notifies servo_task.
- * ───────────────────────────────────────────────────────────────────────── */
+static inline __attribute__((always_inline)) void pps_raw_phc_snapshot(pps_raw_capture_t *raw)
+{
+    raw->ctrl_before = EMAC_PTP.timestamp_ctrl.val;
+    raw->seconds_before = EMAC_PTP.sys_seconds.ts_second;
+    raw->before = pps_raw_timer_now();
+    raw->subsecond = EMAC_PTP.sys_nanosec.ts_sub_seconds;
+    raw->after = pps_raw_timer_now();
+    raw->seconds_after = EMAC_PTP.sys_seconds.ts_second;
+    raw->ctrl_after = EMAC_PTP.timestamp_ctrl.val;
+}
+
+static void IRAM_ATTR pps_isr_handler(void *arg)
+{
+    if (atomic_load_explicit(&g_emac_restarting, memory_order_relaxed)) return;
+    unsigned head = atomic_load_explicit(&g_pps_raw_head, memory_order_relaxed);
+    unsigned tail = atomic_load_explicit(&g_pps_raw_tail, memory_order_acquire);
+    if (head - tail == PPS_RAW_QUEUE_SIZE) {
+        /* One producer: a store avoids an ISR read-modify-write loop. */
+        atomic_store_explicit(&g_pps_raw_dropped,
+            atomic_load_explicit(&g_pps_raw_dropped, memory_order_relaxed) + 1,
+            memory_order_relaxed);
+        return;
+    }
+    pps_raw_capture_t *raw = &g_pps_raw[head % PPS_RAW_QUEUE_SIZE];
+    /* Save the ETM latch before software capture overwrites it. */
+    raw->edge = timer_ll_get_counter_value(g_pps_timer_hw, g_pps_timer_id);
+    raw->entry = pps_raw_timer_now();
+    raw->observed_us = esp_timer_get_time();
+    pps_raw_phc_snapshot(raw);
+    raw->attempts = 1;
+    typeof(EMAC_PTP.timestamp_ctrl) ctrl = {.val = raw->ctrl_before};
+    /* A PPS-disciplined clock inevitably moves the sampling instant across
+     * rollover. Preserve the guard against staggered register updates, but
+     * move one replacement sample clear of it instead of freezing the servo.
+     * Binary-mode thresholds conservatively cover the same +/-1 us band. */
+    uint32_t lower = ctrl.ts_digit_bin_roll_ctrl ? 1000U : 2148U;
+    uint32_t upper = ctrl.ts_digit_bin_roll_ctrl ? 999999000U : 2147481500U;
+    if (raw->seconds_before != raw->seconds_after ||
+        raw->subsecond < lower || raw->subsecond >= upper) {
+        esp_rom_delay_us(3); /* Bounded, only near rollover; outside the bracket. */
+        pps_raw_phc_snapshot(raw);
+        raw->attempts = 2;
+    }
+    /* Publish payload first, index last. Task releases slots only after copy. */
+    atomic_store_explicit(&g_pps_raw_head, head + 1, memory_order_release);
+}
+
+static bool pps_raw_pop(pps_raw_capture_t *raw)
+{
+    unsigned tail = atomic_load_explicit(&g_pps_raw_tail, memory_order_relaxed);
+    if (tail == atomic_load_explicit(&g_pps_raw_head, memory_order_acquire)) return false;
+    *raw = g_pps_raw[tail % PPS_RAW_QUEUE_SIZE];
+    atomic_store_explicit(&g_pps_raw_tail, tail + 1, memory_order_release);
+    return true;
+}
+
+/* All validation, calibration, arithmetic and shared diagnostic publication
+ * run here in task context, never in the capture interrupt. */
+static bool pps_prepare_capture(const pps_raw_capture_t *raw, pps_capture_diag_t *out)
+{
+    pps_capture_diag_t diag = {0};
+    diag.edge_ticks = raw->edge;
+    diag.entry_ticks = raw->entry;
+    diag.before_ticks = raw->before;
+    diag.after_ticks = raw->after;
+    diag.isr_observed_us = raw->observed_us;
+    diag.snapshot_attempts = raw->attempts;
+    bool plausible = raw->edge && raw->entry >= raw->edge &&
+                     raw->entry - raw->edge < g_pps_timer_hz / 10;
+    bool accepted = plausible && pps_gate_accept(&g_pps_gate, raw->edge, PPS_CADENCE_GATE_US);
+    portENTER_CRITICAL(&g_pps_capture_lock);
+    g_pps_gate_report = g_pps_gate;
+    if (!accepted) g_pps_rejected_edges++;
+    portEXIT_CRITICAL(&g_pps_capture_lock);
+    if (!accepted) return false;
+    if (g_pps_gate.calibrated) atomic_store(&g_pps_calibrated_hz, g_pps_gate.period);
+
+    /* Decode the raw control values in task context. */
+    typeof(EMAC_PTP.timestamp_ctrl) ctrl_before = {.val = raw->ctrl_before};
+    typeof(EMAC_PTP.timestamp_ctrl) ctrl_after = {.val = raw->ctrl_after};
+    bool digital = ctrl_before.ts_digit_bin_roll_ctrl;
+    uint32_t ns = digital ? raw->subsecond :
+        (uint32_t)(((uint64_t)raw->subsecond * 1000000000ULL) >> 31);
+    diag.phc_ns = (uint64_t)raw->seconds_after * 1000000000ULL + ns;
+    diag.corrected_ns = diag.phc_ns;
+    bool phc_ok = !ctrl_before.ts_initialize && !ctrl_before.ts_update &&
+        !ctrl_after.ts_initialize && !ctrl_after.ts_update &&
+        digital == (bool)ctrl_after.ts_digit_bin_roll_ctrl &&
+        raw->seconds_before == raw->seconds_after && ns >= 1000 && ns < 999999000UL;
+    if (raw->edge <= raw->entry && raw->entry <= raw->before && raw->before <= raw->after) {
+        uint64_t midpoint = raw->before + (raw->after - raw->before) / 2;
+        diag.delay_ns = pps_ticks_to_ns(midpoint - raw->edge);
+        diag.read_window_ns = pps_ticks_to_ns(raw->after - raw->before);
+        diag.valid = phc_ok && diag.delay_ns <= PPS_CAPTURE_MAX_DELAY_NS &&
+            diag.read_window_ns <= PPS_CAPTURE_MAX_READ_WINDOW_NS && diag.phc_ns >= diag.delay_ns;
+        if (diag.valid) diag.corrected_ns -= diag.delay_ns;
+    }
+    *out = diag;
+    return true;
+}
+
 static void pps_task(void *arg)
 {
     /* Gate on timing-core readiness (PHC started + L2TAP bound), NOT on link.
@@ -2227,47 +2721,83 @@ static void pps_task(void *arg)
         vTaskDelay(pdMS_TO_TICKS(500));
     }
 
-    /* Drain any stale PPS notifications captured before PHC was up */
-    while (xSemaphoreTake(g_pps_sem, 0) == pdTRUE)
-    { /* discard */
-    }
-
-    static uint32_t last_capture_seq = 0;
+    /* Ignore pre-ready snapshots; only the consumer advances the tail. */
+    atomic_store_explicit(&g_pps_raw_tail,
+        atomic_load_explicit(&g_pps_raw_head, memory_order_acquire), memory_order_release);
 
     while (1)
     {
-        // ESP_LOGW("PPS", "Start of PPS Running: integ=%.0f adj=%.1f ppb g_pps_cap_ns=%llu",
-        //          g_integral,
-        //          g_freq_ppb, g_pps_capture_ns);
-        if (xSemaphoreTake(g_pps_sem, portMAX_DELAY))
+        pps_raw_capture_t raw;
+        if (!pps_raw_pop(&raw)) {
+            vTaskDelay(1); /* 10 ms at current tick rate; no ISR scheduler calls. */
+            continue;
+        }
         {
-            /*
-             * Use the PHC value captured INSIDE the ISR, not a fresh
-             * read from this task. This is what gives us sub-µs
-             * accuracy: the value is sampled within ~1 µs of the
-             * actual PPS edge, before any FreeRTOS scheduling delay.
-             */
-            /* Read seq+ns together under the same lock the ISR uses, so the
-             * 64-bit ns value cannot tear against a concurrent ISR on the
-             * other core. */
+            pps_capture_diag_t diag;
+            if (!pps_prepare_capture(&raw, &diag)) continue;
+            uint64_t phc_ns = PPS_CAPTURE_APPLY_CORRECTION && diag.valid
+                ? diag.corrected_ns : diag.phc_ns;
             portENTER_CRITICAL(&g_pps_capture_lock);
-            uint32_t seq = g_pps_capture_seq;
-            uint64_t phc_ns = g_pps_capture_ns;
+            uint32_t seq = ++g_pps_capture_seq;
+            g_pps_diag = diag;
+            g_pps_capture_ns = phc_ns;
             portEXIT_CRITICAL(&g_pps_capture_lock);
-
-            if (seq == last_capture_seq)
-                continue; /* spurious wake — no new edge */
-            last_capture_seq = seq;
             uint64_t phc_s = phc_ns / 1000000000ULL;
 
-            /* ── PPS edge-to-edge jitter (raw receiver timing noise) ──
+            /* Observation runs outside the ISR. Cross-clock rate is diagnostic
+             * only: PHC steps and changing servo frequency invalidate a fixed
+             * mapping. Use a fresh local bracket for every candidate correction. */
+            static uint64_t previous_mid_ticks, previous_phc_ns;
+            uint64_t mid_ticks = diag.before_ticks +
+                                 (diag.after_ticks - diag.before_ticks) / 2;
+            int64_t rate_ppb = 0;
+            bool rate_valid = false;
+            if (diag.valid && previous_mid_ticks && mid_ticks > previous_mid_ticks &&
+                diag.phc_ns > previous_phc_ns)
+            {
+                uint64_t elapsed_ns = pps_ticks_to_ns(mid_ticks - previous_mid_ticks);
+                int64_t phc_elapsed = (int64_t)(diag.phc_ns - previous_phc_ns);
+                if (elapsed_ns > 500000000ULL && elapsed_ns < 2000000000ULL &&
+                    phc_elapsed < 2000000000LL &&
+                    llabs(phc_elapsed - (int64_t)elapsed_ns) < 2000000LL)
+                {
+                    rate_ppb = (phc_elapsed - (int64_t)elapsed_ns) * 1000000000LL /
+                               (int64_t)elapsed_ns;
+                    rate_valid = llabs(rate_ppb) < 1000000LL;
+                }
+            }
+            previous_mid_ticks = diag.valid ? mid_ticks : 0;
+            previous_phc_ns = diag.phc_ns;
+            if (seq % TIMING_LOG_INTERVAL == 0)
+            ESP_LOGI("PPS_CAPTURE",
+                     "seq=%lu edge=%llu entry=%llu before=%llu after=%llu "
+                     "phc=%llu candidate=%llu entry_delay=%llu ns correction=%llu ns "
+                     "read_window=%llu ns rate=%lld ppb rate_valid=%d valid=%d applied=%d "
+                     "direct=%d tries=%u ioctl_window=%llu ns ioctl_delta=%lld ns compare_valid=%d ioctl_retries=%u",
+                     (unsigned long)seq, (unsigned long long)diag.edge_ticks,
+                     (unsigned long long)diag.entry_ticks,
+                     (unsigned long long)diag.before_ticks,
+                     (unsigned long long)diag.after_ticks,
+                     (unsigned long long)diag.phc_ns,
+                     (unsigned long long)diag.corrected_ns,
+                     (unsigned long long)(diag.entry_ticks >= diag.edge_ticks
+                         ? pps_ticks_to_ns(diag.entry_ticks - diag.edge_ticks) : 0),
+                     (unsigned long long)diag.delay_ns,
+                     (unsigned long long)diag.read_window_ns,
+                     (long long)rate_ppb, rate_valid, diag.valid,
+                     PPS_CAPTURE_APPLY_CORRECTION && diag.valid,
+                     PPS_CAPTURE_DIRECT_PHC, diag.snapshot_attempts,
+                     (unsigned long long)diag.ioctl_window_ns,
+                     (long long)diag.ioctl_difference_ns, diag.ioctl_compare_valid, diag.ioctl_retries);
+
+            /* ── PPS edge-to-edge measured interval variation ──
              * Skip the first edge (no prev) and any edge after a long gap
              * (e.g. holdover or initial bring-up); only accumulate when
              * the previous edge is from the immediately previous second.
              * "Plausible" = interval within ±100 ms of 1 s; anything wider
              * is a gap, not jitter. */
             static uint64_t prev_phc_ns_for_jitter = 0;
-            if (prev_phc_ns_for_jitter != 0)
+            if (diag.valid && prev_phc_ns_for_jitter != 0)
             {
                 int64_t interval = (int64_t)phc_ns - (int64_t)prev_phc_ns_for_jitter;
                 int64_t jitter = interval - 1000000000LL;
@@ -2286,13 +2816,64 @@ static void pps_task(void *arg)
                 }
                 /* else: gap event — don't account, but still update prev */
             }
-            prev_phc_ns_for_jitter = phc_ns;
+            prev_phc_ns_for_jitter = diag.valid ? phc_ns : 0;
             /* ── end jitter accumulation ── */
 
             taskENTER_CRITICAL(&g_gnss_spinlock);
             time_t gnss_sec = g_gnss_seconds;
             bool gnss_valid = g_gnss_valid;
+            int64_t sentence_rx_us = g_gnss_sentence_rx_us;
+            const char *sentence_source = g_gnss_sentence_source;
+            gnss_pps_label_t label = {0};
+            static gnss_pps_label_t debug_queue[8];
+            memcpy(debug_queue, g_pps_labels, sizeof(debug_queue));
+            bool label_old = false, label_close = false, label_future = false;
+            for (unsigned i = 0; i < 8; ++i)
+            {
+                gnss_pps_label_t candidate = g_pps_labels[i];
+                int64_t age_us = diag.isr_observed_us - candidate.rx_us;
+                if (candidate.rx_us) {
+                    label_old |= age_us > 650000;
+                    label_close |= age_us >= 0 && age_us < 50000;
+                    label_future |= age_us < 0;
+                }
+                if (candidate.rx_us && age_us >= 50000 && age_us <= 650000 &&
+                    candidate.rx_us > label.rx_us)
+                    label = candidate;
+                /* Consume old messages, retaining any parsed after this edge. */
+                if (candidate.rx_us <= diag.isr_observed_us)
+                    g_pps_labels[i].rx_us = 0;
+            }
+            if (!label.rx_us) {
+                /* Preserve the first missing-label event until the low-priority
+                 * reporter prints it. Never dump serial text from pps_task. */
+                portENTER_CRITICAL(&g_midsecond_dump_lock);
+                if (!g_midsecond_dump.pending) {
+                    g_midsecond_dump.pending = true;
+                    g_midsecond_dump.seq = seq;
+                    g_midsecond_dump.edge_us = diag.isr_observed_us;
+                    g_midsecond_dump.rx_count = g_midsecond_rx_count;
+                    g_midsecond_dump.queue_overwrites = g_midsecond_queue_overwrites;
+                    g_midsecond_dump.replaced = 0;
+                    memcpy(g_midsecond_dump.queue, debug_queue, sizeof(debug_queue));
+                    memcpy(g_midsecond_dump.rx, g_midsecond_rx, sizeof(g_midsecond_rx));
+                } else g_midsecond_dump.replaced++;
+                portEXIT_CRITICAL(&g_midsecond_dump_lock);
+            }
             taskEXIT_CRITICAL(&g_gnss_spinlock);
+
+            if (GNSS_TIME_ASSOC_LOG)
+                ESP_LOGI("GNSS_ASSOC",
+                         "PPS seq=%lu isr_us=%lld hw_edge=%llu phc_ns=%llu "
+                         "latest_utc=%lld source=%s rx_us=%lld "
+                         "pps_isr_minus_rx_us=%lld gnss_valid=%d sentence_offset=%d",
+                         (unsigned long)seq, (long long)diag.isr_observed_us,
+                         (unsigned long long)diag.edge_ticks,
+                         (unsigned long long)diag.phc_ns,
+                         (long long)gnss_sec, sentence_source,
+                         (long long)sentence_rx_us,
+                         (long long)(sentence_rx_us ? diag.isr_observed_us - sentence_rx_us : 0),
+                         gnss_valid, g_sentence_offset);
 
             ESP_LOGD("PPS_DIAG",
                      "phc_s=%llu gnss_sec=%lld so=%d",
@@ -2300,90 +2881,118 @@ static void pps_task(void *arg)
                      (long long)gnss_sec,
                      g_sentence_offset);
 
-            bool log_bootstrap = false;
-            bool log_so_determined = false;
-            bool log_correction = false;
-            int64_t log_so_val = 0;
-            int64_t log_err = 0;
-            uint64_t log_target = 0;
+            /* Establish the epoch with two labels; bridge short label gaps
+             * only through continuous, calibrated hardware PPS captures.
+             * Never infer UTC from the PHC's acquiring absolute time. */
+            static time_t previous_label_utc;
+            static int64_t previous_label_edge_us;
+            static uint64_t previous_label_ticks;
+            static bool epoch_confirmed;
+            static unsigned coast_seconds;
+            pps_gate_t cadence;
+            portENTER_CRITICAL(&g_pps_capture_lock);
+            cadence = g_pps_gate_report;
+            portEXIT_CRITICAL(&g_pps_capture_lock);
+            uint64_t tick_delta = diag.edge_ticks - previous_label_ticks;
+            uint64_t tolerance = (uint64_t)cadence.period * PPS_CADENCE_GATE_US / 1000000ULL;
+            bool continuous = previous_label_ticks && diag.edge_ticks > previous_label_ticks &&
+                cadence.calibrated && tick_delta + tolerance >= cadence.period &&
+                tick_delta <= (uint64_t)cadence.period + tolerance &&
+                diag.isr_observed_us - previous_label_edge_us >= 900000 &&
+                diag.isr_observed_us - previous_label_edge_us <= 1100000;
+            bool label_available = gnss_valid && diag.valid && label.rx_us;
+            bool label_confirmed = label_available &&
+                previous_label_utc && label.utc == previous_label_utc + 1 &&
+                diag.isr_observed_us - previous_label_edge_us >= 900000 &&
+                diag.isr_observed_us - previous_label_edge_us <= 1100000;
+            /* Once confirmed, also require hardware continuity when a fresh
+             * label arrives. A mismatch must never be concealed by coasting. */
+            if (epoch_confirmed && !continuous) label_confirmed = false;
+            bool coast = epoch_confirmed && continuous && gnss_valid && diag.valid &&
+                !label.rx_us && coast_seconds < PPS_LABEL_MAX_COAST_SECONDS;
+            bool was_coasting = coast_seconds != 0;
+            pps_label_reason_t label_reason = LABEL_OK;
+            if (!gnss_valid) label_reason = LABEL_NO_FIX;
+            else if (!diag.valid) label_reason = LABEL_CAPTURE_INVALID;
+            else if (!label.rx_us) label_reason = label_old ? LABEL_TOO_OLD :
+                label_close ? LABEL_TOO_CLOSE : label_future ? LABEL_POST_EDGE : LABEL_NO_MIDSECOND;
+            else if (!previous_label_utc) label_reason = LABEL_WARMUP;
+            else if (label.utc != previous_label_utc + 1) label_reason = LABEL_UTC_SEQUENCE;
+            else if (!label_confirmed) label_reason = LABEL_PPS_INTERVAL;
+            if (coast) {
+                label.utc = previous_label_utc + 1;
+                label_confirmed = true;
+                label_reason = LABEL_COAST;
+                coast_seconds++;
+            } else {
+                coast_seconds = 0;
+            }
+            if ((epoch_confirmed && !label_confirmed) || coast || was_coasting ||
+                (label_confirmed && coast_seconds == 0 && !epoch_confirmed))
+                ESP_LOGI("PPS_EPOCH", "seq=%lu confirmed=%d coast=%u/%u reason=%s",
+                         (unsigned long)seq, label_confirmed, coast_seconds,
+                         PPS_LABEL_MAX_COAST_SECONDS, label_reason_names[label_reason]);
+            epoch_confirmed = label_confirmed;
+            previous_label_utc = (label_available || coast) ? label.utc : 0;
+            previous_label_edge_us = diag.isr_observed_us;
+            previous_label_ticks = diag.edge_ticks;
+            uint64_t target_ns = label_confirmed ?
+                ((uint64_t)label.utc + 1ULL + (uint64_t)g_utc_offset) * 1000000000ULL : 0;
 
             taskENTER_CRITICAL(&g_servo_spinlock);
-
             g_last_pps_phc_ns = phc_ns;
+            g_servo_sample_clean = diag.valid && diag.read_window_ns <= SERVO_MAX_READ_WINDOW_NS;
+            g_servo_sample_us = diag.isr_observed_us;
+            g_servo_raw_ns = diag.phc_ns;
+            g_servo_candidate_ns = diag.corrected_ns;
             g_pps_edge_count++;
-
-            if (gnss_valid)
+            g_gnss_pps_valid = label_confirmed;
+            g_sentence_offset = label_confirmed ? 1 : -1;
+            if (label_confirmed)
             {
-                if (g_sentence_offset < 0 && g_phc_stepped)
-                {
-                    int64_t delta = (int64_t)phc_s - ((int64_t)gnss_sec + (int64_t)g_utc_offset);
-                    if (delta < 0 || delta > 2)
-                        delta = 1;
-                    g_sentence_offset = (int)delta;
-                    log_so_determined = true;
-                    log_so_val = delta;
-                }
-
-                if (g_sentence_offset < 0)
-                {
-                    taskEXIT_CRITICAL(&g_servo_spinlock);
-                    goto do_logging;
-                }
-
-                uint64_t gnss_target =
-                    ((uint64_t)gnss_sec + (uint64_t)g_utc_offset + (uint64_t)g_sentence_offset) * 1000000000ULL;
-
-                if (!g_gnss_pps_valid)
-                {
-                    g_gnss_pps_ns = gnss_target;
-                    g_gnss_pps_valid = true;
-                    log_bootstrap = true;
-                    log_target = gnss_target;
-                }
-                else
-                {
-                    uint64_t expected = g_gnss_pps_ns + 1000000000ULL;
-                    int64_t err = (int64_t)gnss_target - (int64_t)expected;
-
-                    if (llabs(err) > 5000000000LL)
-                    {
-                        g_gnss_pps_ns += 1000000000ULL;
-                    }
-                    else
-                    {
-                        g_gnss_pps_ns = gnss_target;
-                        log_target = gnss_target;
-                        log_err = err;
-                        if (llabs(err) > 10000000LL)
-                            log_correction = true;
-                    }
-                }
-
-                if (g_gnss_pps_valid)
-                    g_phc_offset_ns = (int64_t)phc_ns - (int64_t)g_gnss_pps_ns;
+                g_gnss_pps_ns = target_ns;
+                g_phc_offset_ns = (int64_t)phc_ns - (int64_t)target_ns;
             }
-            else
-            {
-                if (g_gnss_pps_valid)
-                    g_gnss_pps_ns += 1000000000ULL;
-            }
-
             taskEXIT_CRITICAL(&g_servo_spinlock);
 
-        do_logging:
-            if (log_bootstrap)
-                ESP_LOGI("PPS", "Bootstrap: TAI target=%llu s",
-                         (unsigned long long)(log_target / 1000000000ULL));
-            if (log_so_determined)
-                ESP_LOGI("PPS",
-                         "sentence_offset=%lld (sentence arrives %s PPS edge)",
-                         log_so_val,
-                         log_so_val == 0 ? "BEFORE" : "AFTER");
-            if (log_correction)
-                ESP_LOGW("PPS", "GNSS correction: target=%llu err=%lld ns",
-                         (unsigned long long)(log_target / 1000000000ULL),
-                         (long long)log_err);
+            /* Accumulate outside the ISR; only a bounded counter update is
+             * shared with the periodic reporter. One primary reason per PPS. */
+            static const uint32_t window_bounds[] = {4000, 5000, 8000, 12000, 20000};
+            unsigned bucket = 0;
+            while (bucket < 5 && diag.read_window_ns > window_bounds[bucket]) bucket++;
+            bool clean = diag.valid && diag.read_window_ns <= SERVO_MAX_READ_WINDOW_NS;
+            int64_t raw_error = label_confirmed ? (int64_t)diag.phc_ns - (int64_t)target_ns : 0;
+            int64_t candidate_error = label_confirmed ? (int64_t)diag.corrected_ns - (int64_t)target_ns : 0;
+            portENTER_CRITICAL(&g_timing_stats_lock);
+            g_timing_stats.reasons[label_reason]++;
+            if (diag.read_window_ns) g_timing_stats.windows[bucket]++;
+            else g_timing_stats.window_missing++;
+            if (diag.read_window_ns && diag.ioctl_retries)
+                g_timing_stats.retry_windows[bucket]++;
+            if (diag.read_window_ns > g_timing_stats.max_window_ns)
+                g_timing_stats.max_window_ns = diag.read_window_ns;
+            g_timing_stats.quality_rejects += !clean;
+            g_timing_stats.retry_samples += diag.ioctl_retries != 0;
+            g_timing_stats.retry_reads += diag.ioctl_retries;
+            g_timing_stats.direct_retry_samples += diag.snapshot_attempts > 1;
+            if (clean && label_confirmed && llabs(raw_error) < 100000000LL &&
+                llabs(candidate_error) < 100000000LL) {
+                g_timing_stats.paired_count++;
+                g_timing_stats.raw_sum_ns += raw_error;
+                g_timing_stats.candidate_sum_ns += candidate_error;
+            }
+            portEXIT_CRITICAL(&g_timing_stats_lock);
 
+            if (seq % TIMING_LOG_INTERVAL == 0 || !label_confirmed)
+            ESP_LOGI("PPS_LABEL",
+                     "seq=%lu utc=%lld fraction_ms=%d age_us=%lld confirmed=%d target_tai=%llu "
+                     "raw_offset=%lld ns candidate_offset=%lld ns reason=%s",
+                     (unsigned long)seq, (long long)label.utc, label.fraction_ms,
+                     (long long)(label.rx_us ? diag.isr_observed_us - label.rx_us : 0),
+                     label_confirmed, (unsigned long long)(target_ns / 1000000000ULL),
+                     (long long)(label_confirmed ? (int64_t)diag.phc_ns - (int64_t)target_ns : 0),
+                     (long long)(label_confirmed ? (int64_t)diag.corrected_ns - (int64_t)target_ns : 0),
+                     label_reason_names[label_reason]);
             if (servo_task_handle != NULL)
                 xTaskNotifyGive(servo_task_handle);
         }
@@ -2421,11 +3030,14 @@ static void servo_task(void *arg)
     bool prev_holdover = false;
 
     static servo_state_t state = SERVO_UNLOCKED;
-    static int stable_count = 0;
     static int measure_count = 0;
     static int64_t offset_acc = 0;
-    static int64_t prev_acq_offset = INT64_MIN;
     static int acq_rail_streak = 0;  /* consecutive ACQUIRING samples beyond MAX_STEP_NS */
+    static pps_fit_t acq_fit;
+    static pps_fit_t candidate_fit;
+    static pps_fit_t raw_fit;
+    static unsigned fit_good_windows, quality_rejects;
+    static int64_t last_clean_us;
     static int acq_sample_count = 0; /* accepted ACQUIRING samples since last transition */
     uint32_t pps_edges_at_holdover_entry = 0;
     int64_t lock_start_at_holdover_entry = 0; /* preserve lock duration across sentence-only outages */
@@ -2446,14 +3058,24 @@ static void servo_task(void *arg)
         uint64_t pps = g_last_pps_phc_ns;
         uint64_t gnss_pps_snap = g_gnss_pps_ns;
         bool gnss_pps_valid_snap = g_gnss_pps_valid;
+        bool sample_clean = g_servo_sample_clean;
+        int64_t sample_us = g_servo_sample_us;
+        uint64_t raw_ns = g_servo_raw_ns;
+        uint64_t candidate_ns = g_servo_candidate_ns;
         taskEXIT_CRITICAL(&g_servo_spinlock);
 
         bool new_pps = (pps != last_pps);
         if (new_pps)
             last_pps = pps;
 
-        g_holdover = (time(NULL) - g_last_gnss_update > HOLDOVER_TIMEOUT_SEC) || !cur_gnss_valid;
+        if (sample_clean) last_clean_us = sample_us;
+        g_holdover = (last_clean_us && esp_timer_get_time() - last_clean_us > 5000000LL) || (time(NULL) - g_last_gnss_update > HOLDOVER_TIMEOUT_SEC) ||
+                     !cur_gnss_valid || !gnss_pps_valid_snap;
 
+        if (g_holdover) { acq_fit.n = 0; fit_good_windows = 0; }
+        bool save_eligible = FREQUENCY_PERSIST_WRITES_ENABLED && state == SERVO_LOCKED && !g_holdover && llabs(g_last_offset) < 5000;
+        if (atomic_exchange(&g_frequency_save_eligible, save_eligible) && !save_eligible)
+            atomic_fetch_add(&g_frequency_save_epoch, 1);
         if (g_holdover && !prev_holdover)
         {
             /* Before the first GNSS lock there is nothing to hold over — the PHC
@@ -2575,29 +3197,14 @@ static void servo_task(void *arg)
                 ESP_LOGW("SERVO",
                          "GNSS lock restored (PPS was lost) — re-acquiring from scratch");
                 state = SERVO_UNLOCKED;
-                /* g_phc_stepped, g_gnss_pps_valid and g_sentence_offset are
-                 * read (and written) by pps_task inside g_servo_spinlock
-                 * sections on the other core. Reset them under the same lock
-                 * so pps_task can never observe a half-applied reset — e.g.
-                 * re-bootstrapping the reference between the stores.
-                 *
-                 * g_sentence_offset is reset because the receiver was power-
-                 * cycled (that's what a true PPS outage means): its sentence
-                 * timing relative to the PPS edge may have changed, and a
-                 * stale offset would make the fresh acquisition converge a
-                 * full second off TAI. With g_phc_stepped false, pps_task
-                 * re-derives it on the first edge after the next COARSE
-                 * STEP — the same sequencing as first boot, at zero cost. */
+                /* PPS task owns the confirmed epoch. Do not invalidate its
+                 * fresh label here; only reset PHC acquisition state. */
                 taskENTER_CRITICAL(&g_servo_spinlock);
                 g_phc_stepped = false;
-                g_gnss_pps_valid = false;
-                g_sentence_offset = -1;
                 taskEXIT_CRITICAL(&g_servo_spinlock);
                 g_phc_residual_measured = false;
                 g_integral = 0;
                 g_freq_ppb = 0;
-                stable_count = 0;
-                prev_acq_offset = INT64_MIN;
                 measure_count = 0;
                 offset_acc = 0;
                 median_filter_reset();
@@ -2620,10 +3227,22 @@ static void servo_task(void *arg)
         if (!new_pps)
             continue;
 
+        /* No confirmed epoch (fresh label or bounded PPS coast): freeze the servo. */
+        if (!gnss_pps_valid_snap)
+            continue;
+
+        if (!sample_clean)
+        {
+            quality_rejects++;
+            if (quality_rejects % 10 == 1)
+                ESP_LOGW("SERVO", "Read-quality sample rejected (total=%u); holding frequency", quality_rejects);
+            continue;
+        }
         switch (state)
         {
         case SERVO_UNLOCKED:
         {
+            atomic_store(&g_ptp_service_ready, false);
             if (!cur_gnss_valid || cur_gnss_sec < 1577836800LL)
             {
                 ESP_LOGW("SERVO", "Waiting for valid GNSS time (gnss_sec=%lld)",
@@ -2634,11 +3253,14 @@ static void servo_task(void *arg)
             ESP_LOGW("SERVO", "UNLOCKED → ACQUIRING");
             led_set_state(LED_STATE_ACQUIRING);
 
+            acq_fit.n = 0;
+            fit_good_windows = 0;
             state = SERVO_ACQUIRING;
-            stable_count = 0;
+            /* Fit residual drift relative to the adjustment actually applied,
+             * including when reacquiring after a previous lock. */
+            g_freq_ppb = (double)atomic_load(&g_freq_ppb_hw);
             measure_count = 0;
             offset_acc = 0;
-            prev_acq_offset = INT64_MIN;
             acq_rail_streak = 0;
             acq_sample_count = 0;
             g_integral = 0;
@@ -2646,21 +3268,25 @@ static void servo_task(void *arg)
             g_lock_acquired_ms = 0;
             g_settled_after_holdover = false;
 
-            uint32_t tai_sec =
-                (uint32_t)((uint64_t)cur_gnss_sec + (uint64_t)g_utc_offset + 1ULL);
-
-            ESP_LOGW("SERVO", "COARSE STEP → TAI=%" PRIu32 " s", tai_sec);
-
+            /* Step using a current PHC read so task/logging delay since PPS
+             * is preserved rather than setting the edge's time at write time. */
+            struct timespec now_phc;
+            emac_get_time(&now_phc);
+            int64_t now_ns = (int64_t)now_phc.tv_sec * 1000000000LL + now_phc.tv_nsec;
+            int64_t corrected_now = now_ns - (int64_t)pps + (int64_t)gnss_pps_snap;
             eth_mac_time_t t = {
-                .seconds = tai_sec,
-                .nanoseconds = 0,
+                .seconds = (uint32_t)(corrected_now / 1000000000LL),
+                .nanoseconds = (uint32_t)(corrected_now % 1000000000LL),
             };
+            bool coarse_ok = servo_phc_ioctl(ETH_MAC_ESP_CMD_S_PTP_TIME, &t);
+            ESP_LOGW("SERVO", "COARSE STEP -> TAI=%lu s (elapsed time preserved, applied=%d)",
+                     (unsigned long)t.seconds, coarse_ok);
+            if (!coarse_ok) {
+                state = SERVO_UNLOCKED;
+                continue;
+            }
 
-            servo_phc_ioctl(ETH_MAC_ESP_CMD_S_PTP_TIME, &t);
-
-            /* Published under the spinlock: pps_task reads g_phc_stepped
-             * inside its own g_servo_spinlock section (on the other core)
-             * to decide when to determine sentence_offset. */
+            /* Publish PHC acquisition state separately from PPS labeling. */
             taskENTER_CRITICAL(&g_servo_spinlock);
             g_phc_stepped = true;
             taskEXIT_CRITICAL(&g_servo_spinlock);
@@ -2712,8 +3338,6 @@ static void servo_task(void *arg)
                     g_phc_residual_measured = false;
                     g_integral = 0;
                     g_freq_ppb = 0;
-                    stable_count = 0;
-                    prev_acq_offset = INT64_MIN;
                     measure_count = 0;
                     offset_acc = 0;
                     median_filter_reset();
@@ -2738,7 +3362,7 @@ static void servo_task(void *arg)
             if (++acq_sample_count % 300 == 0)
                 ESP_LOGW("SERVO",
                          "ACQUIRING for ~%d min without lock — PPS jitter or "
-                         "antenna/sky-view quality is the likely limit",
+                         "inspect ACQUIRE-FIT spread, sample availability and drift",
                          acq_sample_count / 60);
 
             if (!g_phc_residual_measured)
@@ -2763,7 +3387,11 @@ static void servo_task(void *arg)
                              "ACQUIRE-A: avg offset=%lld ns → corrective step",
                              (long long)avg_offset);
 
-                    int64_t corrected_ns = (int64_t)pps - avg_offset;
+                    struct timespec now_phc;
+                    emac_get_time(&now_phc);
+                    int64_t corrected_ns =
+                        (int64_t)now_phc.tv_sec * 1000000000LL +
+                        now_phc.tv_nsec - avg_offset;
                     if (corrected_ns < 0)
                         corrected_ns = 0;
 
@@ -2781,112 +3409,135 @@ static void servo_task(void *arg)
                 continue;
             }
 
-            // Before refinement with anti wind up via back calculation - Refer to Anti windup.MD
-            // Can be removed after new code is tested for a while under different conditions
-            // if (!g_holdover)
-            //     g_integral += (double)offset;
-            // if (g_integral > SERVO_INTEGRAL_LIMIT)
-            //     g_integral = SERVO_INTEGRAL_LIMIT;
-            // if (g_integral < -SERVO_INTEGRAL_LIMIT)
-            //     g_integral = -SERVO_INTEGRAL_LIMIT;
-
-            // double correction_acq =
-            //     SERVO_KP * (double)offset + SERVO_KI * g_integral;
-            // g_freq_ppb = -correction_acq;
-            // if (g_freq_ppb > SERVO_FREQ_LIMIT_PPB)
-            //     g_freq_ppb = SERVO_FREQ_LIMIT_PPB;
-            // if (g_freq_ppb < -SERVO_FREQ_LIMIT_PPB)
-            //     g_freq_ppb = -SERVO_FREQ_LIMIT_PPB;
-
-            // int32_t adj_acq_ppb = (int32_t)g_freq_ppb;
-            // servo_phc_ioctl(ETH_MAC_ESP_CMD_ADJ_PTP_TIME, &adj_acq_ppb);
-
-            /* ── Integrate with anti-windup ──────────────────────────────────
-             * Tentatively integrate, compute the unsaturated correction, then
-             * clamp the output. If the output saturated, BACK-CALCULATE the
-             * integral to exactly the value that produces the clamped output,
-             * so the integral never stores energy the actuator cannot express.
-             * This prevents the rail-to-rail limit cycle seen on noisy PPS,
-             * while being a no-op whenever the output is not saturated (normal
-             * acquisition on a clean signal behaves exactly as before). */
-
-            /* 1. Tentative integration (unchanged condition: freeze in holdover). */
-            double integral_tentative = g_integral;
-            if (!g_holdover)
-                integral_tentative += (double)offset;
-
-            /* Keep the hard integral clamp as a final backstop. */
-            if (integral_tentative > SERVO_INTEGRAL_LIMIT)
-                integral_tentative = SERVO_INTEGRAL_LIMIT;
-            if (integral_tentative < -SERVO_INTEGRAL_LIMIT)
-                integral_tentative = -SERVO_INTEGRAL_LIMIT;
-
-            /* 2. Unsaturated correction and the resulting (clamped) output. */
-            double correction_acq =
-                SERVO_KP * (double)offset + SERVO_KI * integral_tentative;
-            double freq_unsat = -correction_acq;
-            double freq_sat = freq_unsat;
-            bool saturated = false;
-            if (freq_sat > SERVO_FREQ_LIMIT_PPB)
+            /* Hold the actuator fixed while fitting a 32-second window.
+             * Median long-baseline slopes resist isolated phase spikes. */
+            double sample_t = sample_us / 1000000.0;
+            if (acq_fit.n && sample_t - acq_fit.t[0] > 40.0)
+                acq_fit.n = 0;
+            if (acq_fit.n < PPS_FIT_CAPACITY)
             {
-                freq_sat = SERVO_FREQ_LIMIT_PPB;
-                saturated = true;
+                acq_fit.t[acq_fit.n] = sample_t;
+                raw_fit.t[acq_fit.n] = sample_t;
+                raw_fit.y[acq_fit.n] = (double)((int64_t)raw_ns - (int64_t)gnss_pps_snap);
+                candidate_fit.t[acq_fit.n] = sample_t;
+                candidate_fit.y[acq_fit.n] = (double)((int64_t)candidate_ns - (int64_t)gnss_pps_snap);
+                acq_fit.y[acq_fit.n++] = (double)offset;
+                candidate_fit.n = acq_fit.n;
+                raw_fit.n = acq_fit.n;
             }
-            else if (freq_sat < -SERVO_FREQ_LIMIT_PPB)
+            if (acq_fit.n < PPS_FIT_CAPACITY &&
+                sample_t - acq_fit.t[0] < 32.0)
+                continue;
+
+            pps_fit_result_t fit;
+            unsigned fit_samples = acq_fit.n;
+            bool usable = pps_fit_evaluate(&acq_fit, &fit);
+            if (PPS_COMPARE_FITS)
             {
-                freq_sat = -SERVO_FREQ_LIMIT_PPB;
-                saturated = true;
+                pps_fit_result_t corrected;
+                pps_fit_result_t raw;
+                bool raw_usable = pps_fit_evaluate(&raw_fit, &raw);
+                bool candidate_usable = pps_fit_evaluate(&candidate_fit, &corrected);
+                if (raw_usable && candidate_usable)
+                {
+                    double delay_sum = 0, delay_min = 1e30, delay_max = -1e30;
+                    for (unsigned i = 0; i < fit_samples; ++i) {
+                        double delay = raw_fit.y[i] - candidate_fit.y[i];
+                        delay_sum += delay;
+                        if (delay < delay_min) delay_min = delay;
+                        if (delay > delay_max) delay_max = delay;
+                    }
+                    ESP_LOGI("PPS_FIT_COMPARE",
+                             "samples=%u span=%.1f s raw[phase=%.0f ns drift=%.1f ppb p90=%.0f ns inliers=%u] "
+                             "candidate[phase=%.0f ns drift=%.1f ppb p90=%.0f ns inliers=%u] "
+                             "delay[mean=%.0f min=%.0f max=%.0f ns] control=%s",
+                             fit_samples, acq_fit.t[fit_samples - 1] - acq_fit.t[0],
+                             raw.phase, raw.slope, raw.p90, raw.inliers,
+                             corrected.phase, corrected.slope, corrected.p90, corrected.inliers,
+                             delay_sum / fit_samples, delay_min, delay_max,
+                             PPS_CAPTURE_APPLY_CORRECTION ? "corrected" : "raw");
+                }
+                else ESP_LOGI("PPS_FIT_COMPARE", "samples=%u raw_usable=%d candidate_usable=%d control=%s",
+                              fit_samples, raw_usable, candidate_usable,
+                              PPS_CAPTURE_APPLY_CORRECTION ? "corrected" : "raw");
             }
-
-            if (saturated && !g_holdover)
+            acq_fit.n = 0;
+            if (!usable)
             {
-                /* Back-calculate the integral so that
-                 *   -(Kp*offset + Ki*integral) == freq_sat
-                 * i.e. integral = (-freq_sat - Kp*offset) / Ki
-                 * This holds the integral at exactly the boundary that keeps the
-                 * output pinned at the rail, with no excess accumulation. When
-                 * the error later reverses, the loop comes off the rail
-                 * immediately instead of having to unwind a saturated integral.
-                 * SERVO_KI is a compile-time positive constant (0.3) so the
-                 * division is always safe. */
-                g_integral = (-freq_sat - SERVO_KP * (double)offset) / SERVO_KI;
-
-                /* The back-calculated value is, by construction, within the
-                 * range the actuator can express, but clamp defensively so a
-                 * pathological offset can never push the stored integral past
-                 * its hard limit. */
-                if (g_integral > SERVO_INTEGRAL_LIMIT)
-                    g_integral = SERVO_INTEGRAL_LIMIT;
-                if (g_integral < -SERVO_INTEGRAL_LIMIT)
-                    g_integral = -SERVO_INTEGRAL_LIMIT;
+                fit_good_windows = 0;
+                ESP_LOGW("SERVO", "ACQUIRE-FIT: insufficient clean samples (%u); holding frequency", fit_samples);
+                continue;
             }
-            else
+            bool spread_ok = fit.p90 <= 5000.0 && fit.inliers * 5 >= fit_samples * 4;
+            if (!spread_ok)
             {
-                /* Not saturated (or in holdover, where the integral is frozen):
-                 * accept the tentative integration as-is. This is identical to
-                 * the original behavior in the unsaturated case. */
-                g_integral = integral_tentative;
+                fit_good_windows = 0;
+                ESP_LOGW("SERVO", "ACQUIRE-FIT: noisy window p90=%.0f ns; holding frequency", fit.p90);
+                continue;
             }
-
-            g_freq_ppb = freq_sat;
-
-            int32_t adj_acq_ppb = (int32_t)g_freq_ppb;
-            if (servo_phc_ioctl(ETH_MAC_ESP_CMD_ADJ_PTP_TIME, &adj_acq_ppb))
-                atomic_store(&g_freq_ppb_hw, adj_acq_ppb);
-
-            bool phase_ok = (llabs(offset) < LOCK_OFFSET_NS);
-            bool freq_ok = (prev_acq_offset == INT64_MIN) ||
-                           (llabs(offset - prev_acq_offset) < LOCK_FREQ_DELTA_NS);
-            prev_acq_offset = offset;
-
+            /* Align phase once, while PTP service is still closed. */
+            if (!atomic_load(&g_ptp_service_ready) && !g_ever_locked)
+            {
+                double initial = g_freq_ppb - fit.slope;
+                if (initial > SERVO_FREQ_LIMIT_PPB) initial = SERVO_FREQ_LIMIT_PPB;
+                if (initial < -SERVO_FREQ_LIMIT_PPB) initial = -SERVO_FREQ_LIMIT_PPB;
+                int32_t initial_ppb = (int32_t)initial;
+                if (!servo_phc_ioctl(ETH_MAC_ESP_CMD_ADJ_PTP_TIME, &initial_ppb)) continue;
+                g_freq_ppb = initial_ppb;
+                atomic_store(&g_freq_ppb_hw, initial_ppb);
+                struct timespec now;
+                emac_get_time(&now);
+                int64_t aligned_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec - (int64_t)fit.phase;
+                if (aligned_ns < 0) continue;
+                eth_mac_time_t aligned = {
+                    .seconds = (uint32_t)(aligned_ns / 1000000000LL),
+                    .nanoseconds = (uint32_t)(aligned_ns % 1000000000LL),
+                };
+                if (!servo_phc_ioctl(ETH_MAC_ESP_CMD_S_PTP_TIME, &aligned)) continue;
+                fit_good_windows = 0;
+                avg_reset();
+                median_filter_reset();
+                g_last_offset = 0;
+                atomic_store(&g_ptp_service_ready, true);
+                ESP_LOGI("SERVO", "PTP service enabled after initial fit: drift=%.1f ppb phase=%.0f ns adj=%ld ppb; lock pending",
+                         fit.slope, fit.phase, (long)initial_ppb);
+                continue;
+            }
+            /* ns/s == ppb. Slow phase recovery (120 s) plus measured drift.
+             * No per-sample integrator: a single spike cannot kick the clock. */
+            double change = -0.7 * fit.slope - fit.phase / 120.0;
+            if (change > 100000.0) change = 100000.0;
+            if (change < -100000.0) change = -100000.0;
+            double requested = g_freq_ppb + change;
+            if (requested > SERVO_FREQ_LIMIT_PPB) requested = SERVO_FREQ_LIMIT_PPB;
+            if (requested < -SERVO_FREQ_LIMIT_PPB) requested = -SERVO_FREQ_LIMIT_PPB;
+            int32_t adj_acq_ppb = (int32_t)requested;
+            if (!servo_phc_ioctl(ETH_MAC_ESP_CMD_ADJ_PTP_TIME, &adj_acq_ppb))
+            {
+                fit_good_windows = 0;
+                continue;
+            }
+            g_freq_ppb = adj_acq_ppb;
+            atomic_store(&g_freq_ppb_hw, adj_acq_ppb);
+            offset = (int64_t)fit.phase;
+            g_last_offset = offset;
+            bool phase_ok = fabs(fit.phase) < LOCK_OFFSET_NS;
+            bool freq_ok = fabs(fit.slope) < 100.0;
+            if (phase_ok && freq_ok) fit_good_windows++;
+            else fit_good_windows = 0;
+            ESP_LOGI("SERVO",
+                     "ACQUIRE-FIT: phase=%.0f ns drift=%.1f ppb p90=%.0f ns samples=%u good_windows=%u/2 adj=%ld ppb rejects=%u",
+                     fit.phase, fit.slope, fit.p90, fit_samples, fit_good_windows,
+                     (long)adj_acq_ppb, quality_rejects);
             if (phase_ok && freq_ok)
             {
-                if (++stable_count > LOCK_THRESHOLD)
+                if (fit_good_windows >= 2)
                 {
                     ESP_LOGW("SERVO",
-                             "LOCKED (offset=%lld ns, phase+freq converged %d samples, adj=%ld ppb)",
-                             (long long)offset, stable_count, (long)adj_acq_ppb);
+                             "LOCKED (offset=%lld ns, phase+freq converged %d windows, adj=%ld ppb)",
+                             (long long)offset, (int)fit_good_windows, (long)adj_acq_ppb);
                     state = SERVO_LOCKED;
+                    atomic_store(&g_ptp_service_ready, true);
                     acq_sample_count = 0;
 
                     g_integral = -(double)g_freq_ppb / SERVO_KI_SLOW;
@@ -2918,21 +3569,6 @@ static void servo_task(void *arg)
                     g_ever_locked = true;
                 }
             }
-            else
-            {
-                if ((stable_count & 0x03) == 0)
-                {
-                    ESP_LOGI("SERVO",
-                             "ACQUIRE-B: not locked (offset=%lld phase=%s freq=%s adj=%ld ppb integ=%.0f)",
-                             (long long)offset,
-                             phase_ok ? "OK" : "FAIL",
-                             freq_ok ? "OK" : "FAIL",
-                             (long long)adj_acq_ppb,
-                             g_integral);
-                }
-                stable_count = 0;
-            }
-
             continue;
         }
 
@@ -2990,8 +3626,6 @@ static void servo_task(void *arg)
                     g_phc_residual_measured = false;
                     g_integral = 0;
                     g_freq_ppb = 0;
-                    stable_count = 0;
-                    prev_acq_offset = INT64_MIN;
                     measure_count = 0;
                     offset_acc = 0;
                     median_filter_reset();
@@ -3068,6 +3702,9 @@ static void servo_task(void *arg)
             g_last_offset = offset;
 
 #define LOCK_LOSS_AVG_NS 1000000LL
+            /* Integral-only term estimates oscillator frequency, excluding
+             * the proportional and derivative phase correction terms. */
+            atomic_store(&g_frequency_learned_ppb, (int32_t)(-SERVO_KI_SLOW * g_integral));
 #define LOCK_LOSS_AVG_COUNT 60
             static int avg_bad_count = 0;
 
@@ -3084,8 +3721,6 @@ static void servo_task(void *arg)
                     g_phc_residual_measured = false;
                     g_integral = 0;
                     g_freq_ppb = 0;
-                    stable_count = 0;
-                    prev_acq_offset = INT64_MIN;
                     measure_count = 0;
                     offset_acc = 0;
                     median_filter_reset();
@@ -3133,6 +3768,7 @@ static void servo_task(void *arg)
                 g_qual_raw_max = raw_offset;
             }
 
+            if ((uint64_t)(sample_us / 1000000LL) % TIMING_LOG_INTERVAL == 0)
             ESP_LOGI("SERVO",
                      "state=%d raw=%lld avg=%lld d=%.0f integ=%.0f adj=%ld ppb",
                      state,
@@ -3182,9 +3818,13 @@ static void gnss_task(void *arg)
     {
         int len = uart_read_bytes(GNSS_UART_NUM, chunk, sizeof(chunk),
                                   pdMS_TO_TICKS(10));
+        int64_t chunk_rx_us = esp_timer_get_time();
 
         if (len <= 0)
             continue;
+        size_t uart_pending = 0;
+        if (uart_get_buffered_data_len(GNSS_UART_NUM, &uart_pending) != ESP_OK)
+            uart_pending = UINT32_MAX;
 
         /* Fork the whole chunk into the TAU1201 timing-mode configurator
          * while it's still running — this batch call is the interface
@@ -3210,15 +3850,17 @@ static void gnss_task(void *arg)
                  * parsed. Binary Allystar frames and boot-time partial
                  * lines land here too and are dropped without logging
                  * (see nmea_checksum_ok). */
-                if (nmea_checksum_ok(line))
+                bool checksum_ok = nmea_checksum_ok(line);
+                bool time_parsed = false;
+                if (checksum_ok)
                 {
                     if (strstr(line, "ZDA"))
                     {
-                        parse_zda(line);
+                        time_parsed = parse_zda(line, chunk_rx_us);
                     }
                     else if (strstr(line, "RMC"))
                     {
-                        parse_rmc(line);
+                        time_parsed = parse_rmc(line, chunk_rx_us);
                     }
                     else if (strstr(line, "GGA"))
                     {
@@ -3234,6 +3876,7 @@ static void gnss_task(void *arg)
                     }
                 }
 
+                midsecond_record_rx(line, chunk_rx_us, checksum_ok, time_parsed, uart_pending);
                 idx = 0;
             }
             else if (c != '\r')
@@ -3273,6 +3916,9 @@ static void gnss_signal_task(void *arg)
 
         int64_t age_ms = (esp_timer_get_time() / 1000) - last_ms;
 
+        pps_report_timing_stats();
+        midsecond_report_dump();
+
         if (last_ms == 0)
         {
             ESP_LOGW("GNSS_SIG", "no GSV data received yet — receiver module may not be emitting it");
@@ -3304,13 +3950,15 @@ static void gnss_signal_task(void *arg)
                          "Only %u SVs in fix — receiver may degrade to time-only solution",
                          sv_used);
 
-            /* ── PPS edge-to-edge jitter (snapshot + reset) ──
-             * This is the *raw* receiver timing noise, independent of the
-             * servo. If this is small (< few µs) but offset still jumps,
-             * the problem is the receiver's time *solution* changing
-             * (constellation churn). If this is large, the receiver's
-             * PPS edge itself is jittering. The two diagnoses point at
-             * different fixes. */
+            /* Measured PPS intervals include capture latency and PHC changes;
+             * these statistics cannot identify the electrical cause. */
+            uint32_t rejected_edges;
+            portENTER_CRITICAL(&g_pps_capture_lock);
+            rejected_edges = g_pps_rejected_edges;
+            g_pps_rejected_edges = 0;
+            portEXIT_CRITICAL(&g_pps_capture_lock);
+            ESP_LOGI("GNSS_SIG", "PPS edges rejected (cadence/capture gate, last 30s): %lu",
+                     (unsigned long)rejected_edges);
             int64_t jit_min, jit_max, jit_sum_abs;
             uint32_t jit_count, jit_outliers;
             portENTER_CRITICAL(&g_pps_jit_lock);
@@ -3340,14 +3988,10 @@ static void gnss_signal_task(void *arg)
                  * mean|j| < 1 us) is still perfectly usable for the servo. */
                 if (mean_abs > 5000)
                 {
-                    if (avg < 30)
-                        ESP_LOGW("GNSS_SIG",
-                                 "Weak signal (SNR avg=%u dB-Hz): PPS jitter is high. "
-                                 "Antenna placement or sky view is the limit.",
-                                 avg);
                     ESP_LOGW("GNSS_SIG",
-                             "→ PPS edge jitter exceeds 5 µs mean — receiver PPS quality is the bottleneck "
-                             "(not constellation churn)");
+                             "Measured PPS interval variation exceeds 5 us mean; "
+                             "possible causes include input glitches, capture latency, "
+                             "PHC adjustments, or receiver timing noise");
                 }
             }
             else
@@ -3519,7 +4163,7 @@ static void ptp_rx_task(void *arg)
              * is race-free.)
              * Snapshot + enqueue only; delay_resp_task builds and sends.
              * No logging on the receive hot path. */
-            if (g_i_am_master)
+            if (g_i_am_master && atomic_load(&g_ptp_service_ready))
                 enqueue_delay_req(eth_frame + 14, eth_len - 14, &hw_ts);
             break;
 
@@ -3556,6 +4200,7 @@ static void ptp_tx_task(void *arg)
     {
         if (atomic_load(&g_link_up) &&
             atomic_load(&g_l2tap_ready) &&
+            atomic_load(&g_ptp_service_ready) &&
             g_i_am_master)
         {
             send_sync_and_followup();
@@ -4924,6 +5569,8 @@ static bool timing_core_bringup(void)
         return false;
     }
 
+    frequency_seed_load();
+
     /* Timing core is live: servo + pps may now run and discipline to GNSS,
      * independent of any peer. */
     atomic_store(&g_phc_ready, true);
@@ -5035,36 +5682,35 @@ static esp_err_t ethernet_init(void)
     esp_netif_attach(g_eth_netif, esp_eth_new_netif_glue(g_eth_hndl));
     /* DHCP client is started automatically by ESP_NETIF_DEFAULT_ETH. */
 
-    /* Derive the hostname string and OLED lines from the eFuse MAC now
-     * (pure CPU work, no netif state needed).  The actual set_hostname
-     * call has to wait until after esp_eth_start() in app_main -- see
-     * mac_hostname_apply() there.  Deriving here means the OLED boot
-     * splash can self-identify from the very first frame. */
-    esp_err_t hostname_err =
-        mac_hostname_get(g_hostname,
-                         sizeof g_hostname,
-                         MAC_HOSTNAME_DASHED);
-
-    if (hostname_err != ESP_OK)
+    /* Select the configured identity before the OLED starts. The netif
+     * hostname is applied after esp_eth_start() in app_main. */
+    if (DEVICE_HOSTNAME[0])
     {
-        ESP_LOGE(TAG,
-                 "Failed to derive hostname from MAC: %s",
-                 esp_err_to_name(hostname_err));
-        return hostname_err;
+        snprintf(g_hostname, sizeof g_hostname, "%s", DEVICE_HOSTNAME);
+        /* The display fits 21 characters per row. Split arbitrary custom
+         * names without requiring the generated four-token format. */
+        snprintf(g_host_line1, sizeof g_host_line1, "%.21s", g_hostname);
+        snprintf(g_host_line2, sizeof g_host_line2, "%s",
+                 strlen(g_hostname) > 21 ? g_hostname + 21 : "");
     }
-
-    if (mac_hostname_display_lines(g_hostname,
-                                   g_host_line1,
-                                   sizeof g_host_line1,
-                                   g_host_line2,
-                                   sizeof g_host_line2) != 0)
+    else
     {
-        ESP_LOGE(TAG,
-                 "Failed to format hostname for OLED: %s",
-                 g_hostname);
-        return ESP_FAIL;
+        esp_err_t hostname_err =
+            mac_hostname_get(g_hostname, sizeof g_hostname, MAC_HOSTNAME_DASHED);
+        if (hostname_err != ESP_OK)
+        {
+            ESP_LOGE(TAG, "Failed to derive hostname from MAC: %s",
+                     esp_err_to_name(hostname_err));
+            return hostname_err;
+        }
+        if (mac_hostname_display_lines(g_hostname,
+                                       g_host_line1, sizeof g_host_line1,
+                                       g_host_line2, sizeof g_host_line2) != 0)
+        {
+            ESP_LOGE(TAG, "Failed to format hostname for OLED: %s", g_hostname);
+            return ESP_FAIL;
+        }
     }
-
     ESP_LOGI(TAG, "Device hostname: %s", g_hostname);
     ESP_LOGI(TAG, "OLED hostname line 1: %s", g_host_line1);
     ESP_LOGI(TAG, "OLED hostname line 2: %s", g_host_line2);
@@ -5181,16 +5827,49 @@ static void gnss_uart_init(void)
 
 static void pps_init(void)
 {
-    /* The PPS pin is edge-triggered. If the GNSS module is absent or the
-     * cable is disconnected, this pin floats and a POSEDGE interrupt will
-     * fire continuously on ambient noise — a textbook interrupt storm. The
-     * handler then ran against an uninitialized g_eth_hndl/g_pps_sem (we
-     * were called before ethernet_init and before the semaphores exist, fixed on app_main now also),
-     * which aborted and crashed the panic handler on whichever task happened
-     * to be current. Anchor the pin LOW with the internal pull-down so a
-     * disconnected/missing GNSS leaves the pin defined; PPS is idle-low /
-     * active-high, so this matches the signal's normal resting state and
-     * does not interfere with a real PPS output. */
+    /* ETM and timer objects live for the lifetime of the firmware. Fail boot
+     * explicitly if allocation/configuration fails; never silently claim HW
+     * capture while running the old path. The driver holds the PLL clock's
+     * power-management lock while the timer is enabled. */
+    gptimer_config_t timer_config = {
+        .clk_src = GPTIMER_CLK_SRC_PLL_F80M,
+        .direction = GPTIMER_COUNT_UP,
+        .resolution_hz = PPS_CAPTURE_RESOLUTION_HZ,
+    };
+    ESP_ERROR_CHECK(gptimer_new_timer(&timer_config, &g_pps_timer));
+    ESP_ERROR_CHECK(gptimer_get_resolution(g_pps_timer, &g_pps_timer_hz));
+    pps_gate_init(&g_pps_gate, g_pps_timer_hz);
+    atomic_store(&g_pps_calibrated_hz, g_pps_timer_hz);
+    esp_etm_event_handle_t edge_event;
+    gpio_etm_event_config_t edge_config = {.edge = GPIO_ETM_EVENT_EDGE_POS};
+    ESP_ERROR_CHECK(gpio_new_etm_event(&edge_config, &edge_event));
+    ESP_ERROR_CHECK(gpio_etm_event_bind_gpio(edge_event, PPS_GPIO));
+    esp_etm_task_handle_t capture_task;
+    gptimer_etm_task_config_t capture_config = {.task_type = GPTIMER_ETM_TASK_CAPTURE};
+    ESP_ERROR_CHECK(gptimer_new_etm_task(g_pps_timer, &capture_config, &capture_task));
+    /* Resolve the allocated timer from its ETM ID, rather than assuming
+     * the driver always allocates group 0/timer 0. IDF-private interface is
+     * used only at boot; the ISR only sees the resulting register address. */
+    for (unsigned group = 0; group < 2; ++group) {
+        for (unsigned timer = 0; timer < 2; ++timer) {
+            if (capture_task->task_id == TIMER_LL_ETM_TASK_TABLE(group, timer, GPTIMER_ETM_TASK_CAPTURE)) {
+                g_pps_timer_hw = TIMER_LL_GET_HW(group);
+                g_pps_timer_id = timer;
+            }
+        }
+    }
+    ESP_ERROR_CHECK(g_pps_timer_hw ? ESP_OK : ESP_ERR_NOT_SUPPORTED);
+    esp_etm_channel_handle_t capture_channel;
+    esp_etm_channel_config_t channel_config = {0};
+    ESP_ERROR_CHECK(esp_etm_new_channel(&channel_config, &capture_channel));
+    ESP_ERROR_CHECK(esp_etm_channel_connect(capture_channel, edge_event, capture_task));
+    ESP_ERROR_CHECK(gptimer_enable(g_pps_timer));
+    ESP_ERROR_CHECK(gptimer_start(g_pps_timer));
+    ESP_ERROR_CHECK(esp_etm_channel_enable(capture_channel));
+    ESP_LOGI("PPS_CAPTURE", "GPIO %d -> ETM -> GPTimer: %lu Hz, correction=%d",
+             PPS_GPIO, (unsigned long)g_pps_timer_hz, PPS_CAPTURE_APPLY_CORRECTION);
+    /* Keep the disconnected PPS input defined (idle low). The ETM latch
+     * and raw queue must be initialized before enabling its GPIO interrupt. */
     gpio_config_t io_conf = {
         .pin_bit_mask = (1ULL << PPS_GPIO),
         .mode = GPIO_MODE_INPUT,
@@ -5201,17 +5880,9 @@ static void pps_init(void)
 
     gpio_config(&io_conf);
 
-    /* DELIBERATE: the ISR service is registered WITHOUT ESP_INTR_FLAG_IRAM.
-     * pps_isr_handler is IRAM_ATTR, but it calls esp_eth_ioctl(), which is
-     * flash-resident — flagging the interrupt IRAM would let it fire during
-     * flash-cache-off windows (OTA erase/write) and crash on the first
-     * flash-resident call. Without the flag the interrupt is simply
-     * DEFERRED across those windows: during an OTA upload, the occasional
-     * PPS capture lands milliseconds late and shows up as HARD_REJECT
-     * streak entries on OLED screen 2 — expected, bounded, self-clearing.
-     * Making the capture path truly IRAM-safe would mean bypassing
-     * esp_eth_ioctl for raw PHC register reads, which is more fragile
-     * across IDF upgrades than the ms-scale OTA-only artifact it removes. */
+    /* Keep cache-off deferral unchanged for this experiment. The ISR itself
+     * is in IRAM; enabling an IRAM interrupt also requires auditing the GPIO
+     * dispatch and every called helper/data object. No driver calls remain. */
     gpio_install_isr_service(0);
     gpio_isr_handler_add(PPS_GPIO, pps_isr_handler, NULL);
 }
@@ -5244,44 +5915,40 @@ void app_main(void)
     // esp_log_level_set("*", ESP_LOG_WARN);
     //  esp_log_level_set("PTP_SERVER", ESP_LOG_INFO);
 
-    u8g2_esp32_hal_t u8g2_esp32_hal = U8G2_ESP32_HAL_DEFAULT;
-    u8g2_esp32_hal.bus.i2c.sda = PIN_SDA;
-    u8g2_esp32_hal.bus.i2c.scl = PIN_SCL;
-    u8g2_esp32_hal_init(u8g2_esp32_hal);
+    if (OLED_ENABLED) {
+        u8g2_esp32_hal_t u8g2_esp32_hal = U8G2_ESP32_HAL_DEFAULT;
+        u8g2_esp32_hal.bus.i2c.sda = PIN_SDA;
+        u8g2_esp32_hal.bus.i2c.scl = PIN_SCL;
+        u8g2_esp32_hal_init(u8g2_esp32_hal);
 
-    u8g2_Setup_sh1106_i2c_128x64_noname_f(&u8g2, U8G2_R0,
+        u8g2_Setup_sh1106_i2c_128x64_noname_f(&u8g2, U8G2_R0,
                                           // u8x8_byte_sw_i2c,
                                           u8g2_esp32_i2c_byte_cb,
                                           u8g2_esp32_gpio_and_delay_cb); // init u8g2 structure
 
-    u8x8_SetI2CAddress(&u8g2.u8x8, 0x78);
-    // u8x8_SetI2CAddress(&u8g2.u8x8, 0x3C << 1);
+        u8x8_SetI2CAddress(&u8g2.u8x8, 0x78);
+        // u8x8_SetI2CAddress(&u8g2.u8x8, 0x3C << 1);
 
-    ESP_LOGI(TAG, "u8g2_InitDisplay");
-    u8g2_InitDisplay(&u8g2); // send init sequence to the display, display is in
+        ESP_LOGI(TAG, "u8g2_InitDisplay");
+        u8g2_InitDisplay(&u8g2); // send init sequence to the display, display is in
                              // sleep mode after this,
+    } else {
+        ESP_LOGI(TAG, "OLED disabled (headless mode)");
+    }
 
     /* Record boot time for uptime display */
     g_boot_time_ms = esp_timer_get_time() / 1000;
 
     /* Launch button + display tasks (low priority — never block timing-critical work) */
     xTaskCreate(button_task, "btn", BUTTON_TASK_STACK, NULL, BUTTON_TASK_PRIO, NULL);
-    xTaskCreate(display_task, "display", DISPLAY_TASK_STACK, NULL, DISPLAY_TASK_PRIO, NULL);
+    if (OLED_ENABLED) {
+        xTaskCreate(display_task, "display", DISPLAY_TASK_STACK, NULL, DISPLAY_TASK_PRIO, NULL);
+    }
 
-    /* ─────────────────────────────────────────────────────────────────────
-     * Order matters: every dependency of pps_isr_handler must exist BEFORE
-     * pps_init() arms the GPIO interrupt. The handler does:
-     *     emac_get_time(&ts)       → esp_eth_ioctl(g_eth_hndl, ...)
-     *     xSemaphoreGiveFromISR(g_pps_sem, ...)
-     * so g_pps_sem must be created and g_eth_hndl must be populated (i.e.
-     * ethernet_init + esp_eth_start completed) before the first edge can
-     * possibly fire. Otherwise a PPS pulse landing in this window — or a
-     * floating PPS pin firing on noise when no GNSS module is attached —
-     * dereferences NULL inside the ISR and panics the box at boot.
-     * ───────────────────────────────────────────────────────────────────── */
+    /* Initialize Ethernet and capture resources before arming PPS. The raw
+     * queue is static; the capture ISR no longer depends on a semaphore. */
 
     g_eth_up_sem = xSemaphoreCreateBinary();
-    g_pps_sem = xSemaphoreCreateBinary();
 
     /* Serializes the shared L2TAP fd across delay_resp_task + ptp_tx_task.
      * Must exist before any l2tap_send_ptp call (the PTP tasks below). */
@@ -5326,7 +5993,7 @@ void app_main(void)
     if (g_hostname[0])
         mac_hostname_apply(g_eth_netif, g_hostname);
 
-    /* Now safe to arm the PPS GPIO interrupt: g_pps_sem and g_eth_hndl exist. */
+    /* Arm capture only after Ethernet initialization. */
     pps_init();
 
     /* Start the LED subsystem BEFORE timing_core_bringup, so that if bring-up
@@ -5404,6 +6071,7 @@ void app_main(void)
     xTaskCreate(gnss_signal_task, "gnss_sig", 3072, NULL, 1, NULL);
     xTaskCreate(servo_task, "servo", 6144, NULL, 6, &servo_task_handle);
     xTaskCreate(pps_task, "pps_task", 4096, NULL, 7, NULL);
+    xTaskCreate(frequency_save_task, "freq_save", 4096, NULL, 1, NULL);
 
     xTaskCreate(heap_monitor_task, "heap_mon", 3072, NULL, 1, NULL);
 

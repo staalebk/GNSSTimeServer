@@ -7,11 +7,11 @@ idf_component_register(
         # networking stack
         esp_eth esp_event esp_netif lwip
         # storage / OTA
-        app_update esp_partition
+        app_update esp_partition nvs_flash
         # system runtime
         esp_system esp_timer freertos vfs
         # peripherals & display
-        driver u8g2 u8g2-hal-esp-idf
+        driver esp_driver_gptimer esp_driver_gpio esp_hw_support u8g2 u8g2-hal-esp-idf
         # web
         esp_http_server
         # local components

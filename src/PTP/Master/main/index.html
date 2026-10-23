@@ -237,7 +237,7 @@
       <div class="mark">P4</div>
       <div>
         <h1>GNSS Time Server</h1>
-        <div class="sub">IEEE 1588-2008 &middot; L2/Ethernet Transport &middot; Domain 0</div>
+        <div class="sub" id="ptpTransport">IEEE 1588-2008 &middot; Waiting for transport</div>
       </div>
     </div>
     <div class="header-actions">
@@ -248,6 +248,7 @@
       <nav class="tabs" aria-label="Dashboard views">
         <button id="statusTab" aria-pressed="true" aria-controls="statusPanel">Overview</button>
         <button id="systemTab" aria-pressed="false" aria-controls="systemPanel">System</button>
+        <button id="settingsTab" aria-pressed="false">Settings</button>
       </nav>
     </div>
   </header>
@@ -263,14 +264,14 @@
         <div class="sub" id="v_state_sub">awaiting data</div>
       </div>
       <div class="metric">
-        <div class="metric-head"><span class="icon">&#x1F3AF;</span><span class="label">Offset</span></div>
-        <div class="big" id="v_offset">&mdash;</div>
-        <div class="sub" id="v_offset_sub">median window: 5</div>
+        <div class="metric-head"><span class="icon">&#x1F3AF;</span><span class="label">Clock class</span></div>
+        <div class="big" id="v_class">&mdash;</div>
+        <div class="sub" id="v_class_sub">Last transmitted Announce</div>
       </div>
       <div class="metric">
-        <div class="metric-head"><span class="icon">&#x269B;&#xFE0F;</span><span class="label">Frequency Adj.</span></div>
-        <div class="big" id="v_freq">&mdash;</div>
-        <div class="sub" id="v_freq_sub">Kp=0.4 &middot; Ki=0.3</div>
+        <div class="metric-head"><span class="icon">&#x269B;&#xFE0F;</span><span class="label">Clock accuracy</span></div>
+        <div class="big" id="v_accuracy">&mdash;</div>
+        <div class="sub" id="v_accuracy_sub">Last transmitted Announce</div>
       </div>
       <div class="metric">
         <div class="metric-head"><span class="icon">&#x1F6F0;&#xFE0F;</span><span class="label">GNSS / PPS</span></div>
@@ -283,21 +284,24 @@
     <div class="card col-7"><div class="card-header"><h2>GNSS reception</h2><span class="badge" id="satAge">Waiting</span></div><div class="sat-summary" id="satSummary">—</div><div id="constellations" class="time-note"></div><div class="sat-scroll"><table class="tasks"><thead><tr><th>System / SV</th><th>Elevation</th><th>Azimuth</th><th>C/N₀</th></tr></thead><tbody id="satBody"></tbody></table></div><p class="time-note">C/N₀ in dB-Hz. Missing observations show —. Combined reports take precedence; PRNs are unique within each receiver talker. Per-satellite fix usage is not inferred from signal strength.</p></div>
     <div class="card col-12"><div class="card-header"><h2>Time reference</h2><span class="badge">GNSS → PPS → hardware clock → PTP</span></div><div class="reference-grid"><div><div class="row"><span class="icon">·</span><span class="label">GNSS UTC date</span><span class="value" id="refDate">—</span></div><div class="row"><span class="icon">·</span><span class="label">Unix timestamp · UTC</span><span class="value" id="refEpoch">—</span></div><div class="row"><span class="icon">·</span><span class="label">TAI · configured UTC offset</span><span class="value" id="refTai">—</span></div></div><div><div class="row"><span class="icon">·</span><span class="label">Time sentence</span><span class="value" id="refSentence">—</span></div><div class="row"><span class="icon">·</span><span class="label">Sentence age</span><span class="value" id="refAge">—</span></div><div class="row"><span class="icon">·</span><span class="label">PPS reference</span><span class="value" id="refPps">—</span></div></div></div></div>
     <div class="card col-12"><div class="card-header"><h2>Timing history</h2><span class="badge" id="historyState">Loading history</span></div>
-      <div class="history-note">Worst status per interval: <span style="color:#50fa7b">Locked</span> ? <span style="color:#f1fa8c">Acquiring</span> ? <span style="color:#ffb86c">Holdover</span> ? <span style="color:#ff5577">No link</span> ? <span style="color:#bd93f9">Fault / unknown</span>. Gray = no data.<br>Frequency adjustment: minimum?maximum applied ppb per interval. Collected on device every second; resets on reboot. Current interval is partial.</div>
-      <div class="history-grid"><div><h3>Last 24 hours ? 15-minute intervals</h3><svg id="historyStatus2" viewBox="0 0 360 42" role="img" aria-label="Last 24 hours: worst status"></svg><h3>Frequency adjustment ? ppb</h3><svg id="historyFreq2" viewBox="0 0 360 150" role="img" aria-label="Last 24 hours: frequency range"></svg><div class="history-axis"><span>?24h</span><span>Now</span></div></div><div><h3>Last hour ? 1-minute intervals</h3><svg id="historyStatus1" viewBox="0 0 360 42" role="img" aria-label="Last hour: worst status"></svg><h3>Frequency adjustment ? ppb</h3><svg id="historyFreq1" viewBox="0 0 360 150" role="img" aria-label="Last hour: frequency range"></svg><div class="history-axis"><span>?1h</span><span>Now</span></div></div><div><h3>Last 60 seconds ? 1-second intervals</h3><svg id="historyStatus0" viewBox="0 0 360 42" role="img" aria-label="Last 60 seconds: worst status"></svg><h3>Frequency adjustment ? ppb</h3><svg id="historyFreq0" viewBox="0 0 360 150" role="img" aria-label="Last 60 seconds: frequency range"></svg><div class="history-axis"><span>?60s</span><span>Now</span></div></div></div>
+      <div class="history-note">Worst status per interval: <span style="color:#50fa7b">Locked</span> &middot; <span style="color:#f1fa8c">Acquiring</span> &middot; <span style="color:#ffb86c">Holdover</span> &middot; <span style="color:#ff5577">No link</span> &middot; <span style="color:#bd93f9">Fault / unknown</span>. Gray = no data.<br>Frequency adjustment: minimum&ndash;maximum applied ppb per interval. Collected on device every second; resets on reboot. Current interval is partial.</div>
+      <div class="history-grid"><div><h3>Last 24 hours &middot; 15-minute intervals</h3><svg id="historyStatus2" viewBox="0 0 360 42" role="img" aria-label="Last 24 hours: worst status"></svg><h3>Frequency adjustment &middot; ppb</h3><svg id="historyFreq2" viewBox="0 0 360 150" role="img" aria-label="Last 24 hours: frequency range"></svg><div class="history-axis"><span>&minus;24h</span><span>Now</span></div></div><div><h3>Last 5 minutes &middot; 5-second intervals</h3><svg id="historyStatus1" viewBox="0 0 360 42" role="img" aria-label="Last 5 minutes: worst status"></svg><h3>Frequency adjustment &middot; ppb</h3><svg id="historyFreq1" viewBox="0 0 360 150" role="img" aria-label="Last 5 minutes: frequency range"></svg><div class="history-axis"><span>&minus;5m</span><span>Now</span></div></div><div><h3>Last 60 seconds &middot; 1-second intervals</h3><svg id="historyStatus0" viewBox="0 0 360 42" role="img" aria-label="Last 60 seconds: worst status"></svg><h3>Frequency adjustment &middot; ppb</h3><svg id="historyFreq0" viewBox="0 0 360 150" role="img" aria-label="Last 60 seconds: frequency range"></svg><div class="history-axis"><span>&minus;60s</span><span>Now</span></div></div></div>
     </div>
+    <div class="card col-12"><div class="card-header"><h2>GNSS history</h2><span class="badge">Same intervals as timing history</span></div>
+    <div class="history-note">Satellites: <span style="color:#8be9fd">in view</span> / <span style="color:#50fa7b">in use</span>, minimum&ndash;maximum per interval.<br>Signal C/N&#8320;: minimum&ndash;maximum band with average line, in dB-Hz (higher is stronger). Average covers fresh, positive signal reports sampled each second; unreported signals are excluded. Gaps mean no fresh data. Resets on reboot.</div>
+    <div class="history-grid"><div><h3>Last 24 hours &middot; Satellites</h3><svg id="historySats2" viewBox="0 0 360 150" role="img" aria-label="Last 24 hours: satellites in view and in use"></svg><h3>Signal strength &middot; dB-Hz</h3><svg id="historySignal2" viewBox="0 0 360 150" role="img" aria-label="Last 24 hours: signal minimum maximum average"></svg><div class="history-axis"><span>&minus;24h</span><span>Now</span></div></div><div><h3>Last 5 minutes &middot; Satellites</h3><svg id="historySats1" viewBox="0 0 360 150" role="img" aria-label="Last 5 minutes: satellites in view and in use"></svg><h3>Signal strength &middot; dB-Hz</h3><svg id="historySignal1" viewBox="0 0 360 150" role="img" aria-label="Last 5 minutes: signal minimum maximum average"></svg><div class="history-axis"><span>&minus;5m</span><span>Now</span></div></div><div><h3>Last 60 seconds &middot; Satellites</h3><svg id="historySats0" viewBox="0 0 360 150" role="img" aria-label="Last 60 seconds: satellites in view and in use"></svg><h3>Signal strength &middot; dB-Hz</h3><svg id="historySignal0" viewBox="0 0 360 150" role="img" aria-label="Last 60 seconds: signal minimum maximum average"></svg><div class="history-axis"><span>&minus;60s</span><span>Now</span></div></div></div></div>
     <!-- PTP / TIMING -->
     <div class="card col-6">
       <div class="card-header"><h2>PTP &middot; Timing</h2><span class="badge">grandmaster &middot; 2-step</span></div>
       <div class="rows">
         <div class="row"><span class="icon">&#x1F451;</span>
-          <span class="label">Role<span class="hint">BMCA result</span></span>
+          <span class="label">Role<span class="hint">Best master selection</span></span>
           <span class="value accent" id="v_role">&mdash;</span></div>
         <div class="row"><span class="icon">&#x1F194;</span>
           <span class="label">Clock ID</span>
           <span class="value dim" id="v_clockid">&mdash;</span></div>
         <div class="row"><span class="icon">&#x1F551;</span>
-          <span class="label">UTC time<span class="hint">from GNSS &middot; gmtime_r</span></span>
+          <span class="label">UTC time<span class="hint">Latest GNSS sentence</span></span>
           <span class="value info" id="v_utc">&mdash;</span></div>
         <div class="row"><span class="icon">&#x23F3;</span>
           <span class="label">TAI &minus; UTC offset</span>
@@ -322,7 +326,7 @@
 
     <!-- SERVO -->
     <div class="card col-6">
-      <div class="card-header"><h2>Servo &middot; Discipline</h2><span class="badge">PI &middot; linreg window 16</span></div>
+      <div class="card-header"><h2>Servo &middot; Discipline</h2><span class="badge">PI &middot; 32-sample mean</span></div>
       <div class="rows">
         <div class="row"><span class="icon">&#x1F7E2;</span>
           <span class="label">Servo state</span>
@@ -337,10 +341,10 @@
           <span class="label">PPS edges captured</span>
           <span class="value" id="v_pps">&mdash;</span></div>
         <div class="row"><span class="icon">&#x1F6AB;</span>
-          <span class="label">Sample rejects<span class="hint">offset &gt;100&micro;s from avg &middot; lifetime</span></span>
+          <span class="label">Sample rejects<span class="hint">Outliers rejected &middot; lifetime</span></span>
           <span class="value ok" id="v_reject">&mdash;</span></div>
         <div class="row"><span class="icon">&#x1F50D;</span>
-          <span class="label">PHC residual<span class="hint">measured steady-state</span></span>
+          <span class="label">PHC residual<span class="hint">PHC readback residual</span></span>
           <span class="value dim" id="v_phc">&mdash;</span></div>
         <div class="row"><span class="icon">&#x1F198;</span>
           <span class="label">Holdover timeout</span>
@@ -438,10 +442,10 @@
           <span class="label">MAC address</span>
           <span class="value dim" id="v_mac">&mdash;</span></div>
         <div class="row"><span class="icon">&#x1F4E1;</span>
-          <span class="label">L2TAP<span class="hint">EtherType 0x88F7</span></span>
+          <span class="label">L2TAP<span class="hint" id="transportHint">Hardware timestamp interface</span></span>
           <span class="value" id="v_l2tap">&mdash;</span></div>
         <div class="row"><span class="icon">&#x1F4EC;</span>
-          <span class="label">PTP multicast filter</span>
+          <span class="label">PTP multicast destination</span>
           <span class="value dim" id="v_mcast">&mdash;</span></div>
         <div class="row"><span class="icon">&#x1F501;</span>
           <span class="label">EMAC restarts<span class="hint">RX descriptor recovery</span></span>
@@ -549,7 +553,8 @@ const historyNames = ['Locked','Acquiring','Holdover','No link','Fault / unknown
 function renderHistory(data) {
   data.ranges.forEach((range, r) => {
     const samples = range.samples, width = 360 / samples.length;
-    const values = samples.filter(Boolean).flatMap(s => [s[1],s[2]]);
+    const hasFrequency = s => s && Number.isFinite(s[1]) && Number.isFinite(s[2]);
+    const values = samples.filter(hasFrequency).flatMap(s => [s[1],s[2]]);
     let low = values.length ? Math.min(...values) : -1;
     let high = values.length ? Math.max(...values) : 1;
     if (low === high) { low--; high++; }
@@ -558,13 +563,41 @@ function renderHistory(data) {
     samples.forEach((s,i) => {
       const x = i*width;
       const age = (samples.length-1-i)*range.step_s;
-      const title = s ? age+'?'+(age+range.step_s)+'s ago: '+historyNames[s[0]]+', '+s[1]+' to '+s[2]+' ppb' : 'No recorded data';
+      const title = s ? age+' to '+(age+range.step_s)+'s ago: '+historyNames[s[0]]+
+        (hasFrequency(s) ? ', '+s[1]+' to '+s[2]+' ppb' : ', frequency unavailable') : 'No recorded data';
       status += '<rect x="'+x+'" y="4" width="'+Math.max(1,width-.5)+'" height="28" fill="'+(s ? historyColors[s[0]] : '#394150')+'"><title>'+title+'</title></rect>';
-      if (s) freq += '<rect x="'+x+'" y="'+y(s[2])+'" width="'+Math.max(1,width-.5)+'" height="'+Math.max(2,y(s[1])-y(s[2]))+'" fill="#8be9fd"><title>'+title+'</title></rect>';
+      if (hasFrequency(s)) freq += '<rect x="'+x+'" y="'+y(s[2])+'" width="'+Math.max(1,width-.5)+'" height="'+Math.max(2,y(s[1])-y(s[2]))+'" fill="#8be9fd"><title>'+title+'</title></rect>';
     });
+    renderGnssHistory(samples, r, range.step_s);
     $('historyStatus'+r).innerHTML = status;
     $('historyFreq'+r).innerHTML = '<path d="M0 125H360 M0 20H360" stroke="#394150"/>'+freq+'<g fill="#aab4c8" font-size="11"><text x="0" y="12">'+high+' ppb</text><text x="0" y="145">'+low+' ppb</text></g>';
   });
+}
+function renderGnssHistory(samples, r, step) {
+  const width = 360 / samples.length;
+  function chart(id, fields, unit) {
+    const values = samples.filter(Boolean).flatMap(s => fields.flatMap(f => [s[f[0]],s[f[1]]])).filter(Number.isFinite);
+    const top = Math.max(1,...values), y = v => 125-v/top*105;
+    let svg = '<path d="M0 125H360 M0 20H360" stroke="#394150"/>';
+    fields.forEach(([lo,hi,color,name,avg]) => {
+      let previous = null;
+      samples.forEach((s,i) => {
+        if (!s || !Number.isFinite(s[lo]) || !Number.isFinite(s[hi])) { previous = null; return; }
+        const x = i*width, age = (samples.length-1-i)*step;
+        const title = name+': '+s[lo]+' to '+s[hi]+(avg != null ? ', average '+s[avg] : '')+' '+unit+'; '+age+' to '+(age+step)+'s ago';
+        svg += '<rect x="'+x+'" y="'+y(s[hi])+'" width="'+Math.max(1,width-.5)+'" height="'+Math.max(2,y(s[lo])-y(s[hi]))+'" fill="'+color+'" fill-opacity="0.45"><title>'+title+'</title></rect>';
+        if (avg != null && Number.isFinite(s[avg])) {
+          const point = [x+width/2,y(s[avg])];
+          if (previous) svg += '<path d="M'+previous.join(' ')+' L'+point.join(' ')+'" stroke="'+color+'" fill="none"/>';
+          svg += '<circle cx="'+point[0]+'" cy="'+point[1]+'" r="1.5" fill="'+color+'"><title>'+title+'</title></circle>';
+          previous = point;
+        }
+      });
+    });
+    $(id+r).innerHTML = svg+'<g fill="#aab4c8" font-size="11"><text x="0" y="12">'+top+' '+unit+'</text><text x="0" y="145">0</text></g>';
+  }
+  chart('historySats',[[3,4,'#8be9fd','In view'],[5,6,'#50fa7b','In use']],'satellites');
+  chart('historySignal',[[7,8,'#ffb86c','Signal',9]],'dB-Hz');
 }
 let historyBusy = false;
 async function pollHistory() {
@@ -574,8 +607,8 @@ async function pollHistory() {
     const response = await fetch('/api/history', {cache:'no-store'});
     if (!response.ok) throw new Error('History request failed');
     renderHistory(await response.json());
-    setText('historyState','Live ? since boot');
-  } catch (_) { setText('historyState','History unavailable ? retrying'); }
+    setText('historyState','Live \u00b7 since boot');
+  } catch (_) { setText('historyState','History unavailable \u00b7 retrying'); }
   finally { historyBusy = false; }
 }
 
@@ -633,23 +666,20 @@ function render(d, latencyMs = 0) {
   else if (stateUp === "FAULT") mState.classList.add("fault");
   else if (stateUp === "NO_LINK" || stateUp === "NO LINK") mState.classList.add("no-link");
   setText("v_state", stateUp || "\u2014");
-  setText("v_state_sub", d.locked_for ? ("held " + d.locked_for) : "median window: 5");
+  setText("v_state_sub", stateUp === "LOCKED" && d.locked_for ? ("locked for " + d.locked_for) : "PPS discipline");
 
-  /* Hero — Offset */
-  if (typeof d.offset_ns === "number" && (stateUp === "LOCKED" || stateUp === "HOLDOVER")) {
-    const sign = d.offset_ns >= 0 ? "+" : "";
-    $("v_offset").innerHTML = sign + d.offset_ns + ' <span class="unit">ns</span>';
-  } else {
-    setText("v_offset", "\u2014");
-  }
-
-  /* Hero — Frequency */
-  if (typeof d.freq_ppb === "number") {
-    const sign = d.freq_ppb >= 0 ? "+" : "";
-    $("v_freq").innerHTML = sign + d.freq_ppb.toFixed(1) + ' <span class="unit">ppb</span>';
-  } else {
-    setText("v_freq", "\u2014");
-  }
+  /* Quality from the last successfully transmitted Announce. */
+  const sent = d.announce_sent === true;
+  setText("v_class", sent ? d.clock_class : "\u2014");
+  const classes = {6:"Locked / traceable",7:"Holdover / within budget",187:"Holdover / degraded",248:"Unqualified clock"};
+  setText("v_class_sub", sent ? (classes[d.clock_class] || "Announced clock class") : "No Announce sent yet");
+  const accuracies = ["25 ns","100 ns","250 ns","1 us","2.5 us","10 us","25 us","100 us","250 us","1 ms","2.5 ms","10 ms","25 ms","100 ms","250 ms","1 s","10 s"];
+  const accuracy = d.clock_accuracy;
+  setText("v_accuracy", !sent ? "\u2014" : accuracy >= 0x20 && accuracy <= 0x30 ? "\u2264 " + accuracies[accuracy-0x20] : accuracy === 0x31 ? "> 10 s" : "Unknown");
+  setText("v_accuracy_sub", sent ? "Announce code 0x" + accuracy.toString(16).toUpperCase().padStart(2,"0") : "No Announce sent yet");
+  const udp = d.ptp_udp_ipv4 === true;
+  setText("ptpTransport", "IEEE 1588-2008 \u00B7 " + (d.ptp_udp_ipv4 == null ? "Transport unavailable" : udp ? "UDP/IPv4 multicast \u00B7 E2E \u00B7 Domain " + (d.ptp_domain != null ? d.ptp_domain : "?") : "Layer-2 Ethernet \u00B7 E2E \u00B7 Domain " + (d.ptp_domain != null ? d.ptp_domain : "?")));
+  setText("transportHint", d.ptp_udp_ipv4 == null ? "Hardware timestamp interface" : udp ? "IPv4 \u00B7 UDP ports 319 / 320" : "EtherType 0x88F7");
 
   /* Hero — GNSS */
   setText("v_gnss", d.gnss_fix ? "FIX OK" : "NO FIX");
@@ -695,7 +725,7 @@ function render(d, latencyMs = 0) {
   setText("v_ip_hint", d.ip_source ? d.ip_source : "DHCP/static");
   setText("v_mac", d.mac || "\u2014");
   $("v_l2tap").innerHTML = d.l2tap_ready ? '<span class="chip ok">READY</span>' : '<span class="chip err">NOT READY</span>';
-  setText("v_mcast", "01:1B:19:00:00:00");
+  setText("v_mcast", d.ptp_udp_ipv4 == null ? "\u2014" : udp ? "224.0.1.129" : "01:1B:19:00:00:00");
   const emacV = $("v_emac");
   setText("v_emac", d.emac_restarts != null ? d.emac_restarts : "\u2014");
   emacV.className = "value " + ((d.emac_restarts || 0) === 0 ? "ok" : (d.emac_restarts > 5 ? "err" : "warn"));
@@ -912,6 +942,8 @@ function showPanel(system) {
 }
 $("systemTab").addEventListener("click", () => showPanel(true));
 $("statusTab").addEventListener("click", () => showPanel(false));
+$("settingsTab").addEventListener("click", () => { location.href = "/settings"; });
+if (typeof location !== "undefined") showPanel(location.hash === "#system");
 const SAT_COLORS = {GPS:"#4ec9b0",GLONASS:"#ffb86c",Galileo:"#7aa2f7",BeiDou:"#bd93f9",Combined:"#8be9fd",Other:"#f1c40f"};
 let clockAnchorMs = null, clockAnchorAt = 0;
 function tickClock() {

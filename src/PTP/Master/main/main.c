@@ -104,6 +104,8 @@
 
 #include "esp_vfs_l2tap.h"
 #include "lwip/prot/ethernet.h"
+#include "lwip/sockets.h"
+#include "ptp_transport.h"
 
 #include "driver/uart.h"
 #include "driver/gpio.h"
@@ -113,6 +115,10 @@
 #include "esp_etm.h"
 #include "pps_fit.h"
 #include "pps_gate.h"
+#include "gnss_epoch.h"
+#include "startup_slew.h"
+#include "pps_epoch.h"
+#include "clock_quality.h"
 #include "hal/timer_ll.h"
 #include "esp_private/etm_interface.h"
 #include "nvs.h"
@@ -152,34 +158,11 @@
 #define STATIC_IP_NETMASK ESP_IP4TOADDR(255, 255, 255, 0)
 #define STATIC_IP_GATEWAY ESP_IP4TOADDR(192, 168, 1, 1)
 
-/* ─── PTP protocol (IEEE 1588-2008) ───
- * Sync cadence is 1 Hz, Announce 0.5 Hz. ptp_tx_task ticks at
- * PTP_SYNC_INTERVAL_MS and sends an Announce every PTP_ANNOUNCE_DIV ticks.
- *
- * NOTE: the on-wire logMessageInterval fields in build_ptp_header() calls
- * (0 for Sync/FollowUp, 1 for Announce) are hardcoded to match these
- * defaults (log2(1s)=0, log2(2s)=1). If you change the intervals to values
- * that no longer satisfy log2(interval_sec) ∈ {0,1}, update those literals
- * in send_sync_and_followup() and send_announce() as well so slaves see
- * the advertised cadence match the actual one. */
-#define PTP_SYNC_INTERVAL_MS 1000
-#define PTP_ANNOUNCE_INTERVAL_MS 2000
-
-/* Announce-every-N-Sync-ticks divisor, computed at compile time.
- * Round to nearest so a non-integer ratio picks the closest viable cadence. */
-#define PTP_ANNOUNCE_DIV \
-    (((PTP_ANNOUNCE_INTERVAL_MS) + (PTP_SYNC_INTERVAL_MS) / 2) / (PTP_SYNC_INTERVAL_MS))
-
-_Static_assert(PTP_SYNC_INTERVAL_MS > 0,
-               "PTP_SYNC_INTERVAL_MS must be positive");
-_Static_assert(PTP_ANNOUNCE_INTERVAL_MS >= PTP_SYNC_INTERVAL_MS,
-               "PTP_ANNOUNCE_INTERVAL_MS must be >= PTP_SYNC_INTERVAL_MS "
-               "(the tx task ticks at the Sync rate)");
-_Static_assert(PTP_ANNOUNCE_DIV >= 1,
-               "PTP_ANNOUNCE_DIV must be >= 1 (check the two intervals)");
-// Defined at task creation
-// #define PTP_TASK_PRIORITY 5
-#define PTP_DOMAIN 0
+/* Boot-time PTP configuration. */
+#define PTP_SYNC_INTERVAL_MS settings_interval_ms(g_settings.sync_log)
+#define PTP_ANNOUNCE_INTERVAL_MS settings_interval_ms(g_settings.announce_log)
+#define PTP_ANNOUNCE_DIV (PTP_ANNOUNCE_INTERVAL_MS / PTP_SYNC_INTERVAL_MS)
+#define PTP_DOMAIN (g_settings.domain)
 
 #define PTP_FLAG_TWO_STEP 0x0200
 
@@ -214,6 +197,8 @@ _Static_assert(PTP_ANNOUNCE_DIV >= 1,
 _Static_assert(sizeof(DEVICE_HOSTNAME) <= MAC_HOSTNAME_BUF_LEN,
                "DEVICE_HOSTNAME must be at most 31 characters");
 
+#include "device_settings.h"
+
 #define GNSS_UART_NUM UART_NUM_1
 #define GNSS_TX_PIN 33
 #define GNSS_RX_PIN 32
@@ -224,6 +209,7 @@ _Static_assert(sizeof(DEVICE_HOSTNAME) <= MAC_HOSTNAME_BUF_LEN,
 #define PPS_CAPTURE_APPLY_CORRECTION 1
 #define PPS_CAPTURE_DIRECT_PHC 1 /* Raw register snapshot in the minimal ISR. */
 #define GNSS_TIME_ASSOC_LOG 0 /* Full sentence logging is noisy at 5 Hz. */
+#define PTP_RX_LOG_INTERVAL_MS 60000LL /* Aggregate healthy Delay_Req traffic. */
 /* PLL_F80M is 80 MHz; the P4 timer prescaler must be at least 2. */
 #define PPS_CAPTURE_RESOLUTION_HZ 40000000UL
 _Static_assert(PPS_CAPTURE_RESOLUTION_HZ > 0 &&
@@ -236,7 +222,10 @@ _Static_assert(PPS_CAPTURE_RESOLUTION_HZ > 0 &&
 #define PPS_CADENCE_GATE_US 10U /* Tighten only after prediction-error validation. */
 #define PPS_LABEL_MAX_COAST_SECONDS 5U /* Require fresh UTC confirmation after this gap. */
 #define PPS_COMPARE_FITS 1 /* Identical acquisition samples, raw vs corrected. */
-#define FREQUENCY_PERSIST_WRITES_ENABLED 0 /* Resume after capture-path validation. */
+#define STARTUP_SEED_FIT_SAMPLES 16U
+#define STARTUP_SEED_MAX_DRIFT_PPB 200.0
+#define STARTUP_SEED_MAX_P90_NS 500.0
+#define FREQUENCY_PERSIST_WRITES_ENABLED 1 /* Save stable calibration for the next boot. */
 #define FREQUENCY_SAVE_SAMPLES 21U /* 30-second samples spanning >=10 minutes */
 #define FREQUENCY_SAVE_SPREAD_PPB 200
 #define FREQUENCY_SAVE_CHANGE_PPB 100
@@ -286,7 +275,9 @@ _Static_assert(PPS_CAPTURE_RESOLUTION_HZ > 0 &&
 #define SERVO_KP 0.4 // was 0.7
 #define SERVO_KI 0.3
 #define SERVO_KP_SLOW 0.05
-#define SERVO_KI_SLOW 0.001
+#define SERVO_TUNING_TRIAL 0 /* Original locked-servo gains; 1 selects lower-Ki trial. */
+#define SERVO_KI_SLOW (SERVO_TUNING_TRIAL ? 0.00025 : 0.001)
+#define SERVO_TUNING_LOG_ENABLED 1 /* Buffered 1 Hz locked-servo trace. */
 #define SERVO_KD_SLOW 2.0
 #define SERVO_D_WINDOW 10 /* derivative smoothing samples */
 #define ADJ_SLEW_PPB_PER_S 100.0
@@ -550,7 +541,7 @@ typedef struct
 /* ─── Constants ─── */
 static const char *TAG = "PTP_SERVER";
 static const char *LED_TAG = "LED";
-static const uint8_t PTP_MCAST_MAC[6] = {0x01, 0x1B, 0x19, 0x00, 0x00, 0x00};
+static uint8_t PTP_MCAST_MAC[6];
 
 /* ─── Network / Ethernet ─── */
 static esp_netif_t *g_eth_netif = NULL;
@@ -570,6 +561,8 @@ static _Atomic bool g_l2tap_ready = false;
  * genuinely needs a peer on the wire. */
 static _Atomic bool g_phc_ready = false;
 static _Atomic bool g_ptp_service_ready = false;
+/* History omits the temporary startup slew, including base-rate verification. */
+static _Atomic bool g_startup_phase_active = false;
 /* Set true while emac_restart_preserve_phc() is tearing down / rebuilding the
  * MAC. servo_task must not issue esp_eth_ioctl PHC commands while this is set,
  * or it races the restart's PHC write on the other core. */
@@ -677,6 +670,8 @@ static uint64_t g_servo_raw_ns, g_servo_candidate_ns;
 static time_t g_gnss_seconds = 0;
 static int64_t g_gnss_sentence_rx_us = 0;
 static const char *g_gnss_sentence_source = "none";
+/* Set only by a fresh PPS-confirmed label, protected by g_gnss_spinlock. */
+static int64_t g_gnss_trusted_utc, g_gnss_trusted_rx_us;
 static portMUX_TYPE g_gnss_spinlock = portMUX_INITIALIZER_UNLOCKED;
 /* Only mid-second epochs may label the next PPS. Keep a short queue so
  * messages parsed after an edge cannot hide the pre-edge candidate. */
@@ -688,6 +683,15 @@ typedef struct {
 static gnss_pps_label_t g_pps_labels[8];
 static unsigned g_pps_label_write;
 static bool g_gnss_valid = false;
+
+/* UART-task-owned diagnostics: preserve both sources before logging anomalies. */
+typedef struct {
+    char last_line[128];
+    bool last_checksum, last_parsed, rejecting;
+    uint32_t checksum_failures, bad_total, bad_event;
+    int64_t first_bad_us, last_log_us;
+} gnss_date_diag_t;
+static gnss_date_diag_t g_gnss_date_diag[2]; /* RMC, ZDA */
 typedef struct {
     int64_t rx_us;
     char time_field[16];
@@ -740,6 +744,11 @@ static void midsecond_record_rx(const char *line, int64_t rx_us, bool checksum_o
 {
     if (strlen(line) < 7 || line[0] != '$' ||
         (memcmp(line + 3, "RMC", 3) && memcmp(line + 3, "ZDA", 3))) return;
+    gnss_date_diag_t *date = &g_gnss_date_diag[memcmp(line + 3, "RMC", 3) ? 1 : 0];
+    snprintf(date->last_line, sizeof(date->last_line), "%s", line);
+    date->last_checksum = checksum_ok;
+    date->last_parsed = parsed;
+    if (!checksum_ok) date->checksum_failures++;
     midsecond_rx_debug_t entry = {.rx_us = rx_us, .checksum_ok = checksum_ok,
         .parsed = parsed, .buffered_bytes = buffered_bytes};
     memcpy(entry.source, line + 3, 3);
@@ -849,9 +858,52 @@ typedef struct {
 static pps_timing_stats_t g_timing_stats;
 static portMUX_TYPE g_timing_stats_lock = portMUX_INITIALIZER_UNLOCKED;
 
+typedef struct {
+    int64_t sample_us, raw_ns, avg_ns;
+    int32_t adj_ppb;
+    double p_ppb, i_ppb, d_ppb;
+} servo_tuning_sample_t;
+#define SERVO_TUNING_QUEUE_SIZE 64U
+static servo_tuning_sample_t g_servo_tuning_queue[SERVO_TUNING_QUEUE_SIZE];
+static _Atomic unsigned g_servo_tuning_head, g_servo_tuning_tail, g_servo_tuning_drops;
+
+/* One producer (servo), one consumer (low-priority diagnostics). */
+static void servo_tuning_record(servo_tuning_sample_t sample)
+{
+    if (!SERVO_TUNING_LOG_ENABLED) return;
+    unsigned head = atomic_load_explicit(&g_servo_tuning_head, memory_order_relaxed);
+    if (head - atomic_load_explicit(&g_servo_tuning_tail, memory_order_acquire) == SERVO_TUNING_QUEUE_SIZE) {
+        atomic_fetch_add(&g_servo_tuning_drops, 1);
+        return;
+    }
+    g_servo_tuning_queue[head % SERVO_TUNING_QUEUE_SIZE] = sample;
+    atomic_store_explicit(&g_servo_tuning_head, head + 1, memory_order_release);
+}
+
+static void servo_tuning_report(void)
+{
+    if (!SERVO_TUNING_LOG_ENABLED) return;
+    /* Snapshot the head: never chase a producer indefinitely. */
+    unsigned end = atomic_load_explicit(&g_servo_tuning_head, memory_order_acquire);
+    unsigned tail = atomic_load_explicit(&g_servo_tuning_tail, memory_order_relaxed);
+    while (tail != end) {
+        servo_tuning_sample_t s = g_servo_tuning_queue[tail % SERVO_TUNING_QUEUE_SIZE];
+        atomic_store_explicit(&g_servo_tuning_tail, ++tail, memory_order_release);
+        ESP_LOGI("SERVO_TUNE", "sample_us=%lld raw_ns=%lld avg_ns=%lld adj_ppb=%ld "
+                 "p_ppb=%.3f i_ppb=%.3f d_ppb=%.3f",
+                 (long long)s.sample_us, (long long)s.raw_ns, (long long)s.avg_ns,
+                 (long)s.adj_ppb, s.p_ppb, s.i_ppb, s.d_ppb);
+    }
+    ESP_LOGI("SERVO_TUNE_STATS", "trial=%d kp=%.6f ki=%.6f kd=%.6f avg_window=%u dropped=%u",
+             SERVO_TUNING_TRIAL, (double)SERVO_KP_SLOW, (double)SERVO_KI_SLOW,
+             SERVO_KD_ENABLE ? (double)SERVO_KD_SLOW : 0.0, AVG_WINDOW,
+             atomic_load(&g_servo_tuning_drops));
+}
+
 /* Called by the low-priority report task, regardless of GSV freshness. */
 static void pps_report_timing_stats(void)
 {
+    servo_tuning_report();
     pps_timing_stats_t s;
     pps_gate_t gate;
     portENTER_CRITICAL(&g_pps_capture_lock);
@@ -1008,6 +1060,12 @@ static void frequency_save_task(void *arg)
             (g_frequency_saved_valid && llabs((long long)mean - g_frequency_saved_ppb) < FREQUENCY_SAVE_CHANGE_PPB)) continue;
         frequency_record_t record = {.magic = 0x50545046, .version = 1, .ppb = mean};
         memcpy(record.mac, g_src_mac, sizeof(record.mac));
+        if (!g_settings_mutex) continue;
+        xSemaphoreTake(g_settings_mutex, portMAX_DELAY);
+        if (atomic_load(&g_seed_clear_pending)) {
+            xSemaphoreGive(g_settings_mutex);
+            continue;
+        }
         nvs_handle_t handle;
         esp_err_t err = nvs_open("ptp_freq", NVS_READWRITE, &handle);
         if (err == ESP_OK) {
@@ -1015,6 +1073,7 @@ static void frequency_save_task(void *arg)
             if (err == ESP_OK) err = nvs_commit(handle);
             nvs_close(handle);
         }
+        xSemaphoreGive(g_settings_mutex);
         if (err == ESP_OK) {
             g_frequency_saved_ppb = mean; g_frequency_saved_valid = true;
             last_write_us = now_us;
@@ -1034,7 +1093,6 @@ static volatile uint32_t g_total_rejects = 0;
 static volatile uint64_t g_gnss_pps_ns = 0;
 static volatile bool g_gnss_pps_valid = false;
 static volatile bool g_phc_stepped = false;
-static volatile bool g_phc_residual_measured = false;
 
 /* Which second the time-bearing NMEA sentence describes, relative to the PPS
  * edge it arrives around (0 = the sentence precedes its edge, 1/2 = it
@@ -1086,6 +1144,14 @@ static uint8_t g_qual_raw_samples = 0; /* counter so we reset bounds periodicall
 /* ─── Holdover / post-holdover settling ─── */
 static time_t g_last_gnss_update = 0;
 static bool g_holdover = true;
+/* Servo owns the history; only compact atomic results cross task boundaries. */
+static clock_quality_t g_clock_quality;
+static _Atomic uint16_t g_quality_variance = 0xffff;
+// Packed last successfully transmitted Announce quality; zero means none sent.
+static _Atomic uint32_t g_announced_quality = 0;
+static _Atomic uint32_t g_quality_error_ns = 0xffffffffU;
+static _Atomic uint32_t g_quality_history_minutes;
+static _Atomic uint32_t g_quality_holdover_60s_ns, g_quality_holdover_1h_ns;
 static volatile int64_t g_lock_acquired_ms = 0; /* esp_timer ms when SERVO_LOCKED entered */
 static volatile bool g_settled_after_holdover = false;
 
@@ -1103,6 +1169,7 @@ static bool g_i_am_master = true;
 static bmca_dataset_t g_candidate_master = {0};
 static int g_candidate_count = 0;
 static time_t g_last_announce_rx = 0;
+static unsigned g_announce_timeout_sec = ANNOUNCE_TIMEOUT_SEC;
 
 /* ─── Slave tracking ─── */
 static slave_track_t g_slaves[SLAVE_TRACK_MAX] = {0};
@@ -1350,22 +1417,23 @@ static inline uint8_t advertised_clock_class(void)
 {
     if (!g_ever_locked)
         return 248;
-    return advertise_as_holdover() ? 7 : 6;
+    if (!advertise_as_holdover()) return 6;
+    return atomic_load(&g_quality_error_ns) > CQ_HOLDOVER_SPEC_NS ? 187 : 7;
 }
 
 static void build_local_dataset(bmca_dataset_t *ds)
 {
-    ds->priority1 = 128;
+    ds->priority1 = g_settings.priority1;
 
     // Dynamic depending on GNSS lock + post-holdover settling + never-locked
     uint8_t cc = advertised_clock_class();
     ds->clock_class = cc;
-    /* accuracy: locked → 0x21 (~100 ns), holdover → 0x23, unknown → 0xFE */
-    ds->accuracy = (cc == 6) ? 0x21 : (cc == 7) ? 0x23
-                                                : 0xFE;
+    /* Measured phase allowance or modeled holdover error; unknown -> 0xFE. */
+    uint32_t error_ns = atomic_load(&g_quality_error_ns);
+    ds->accuracy = cc == 248 || error_ns == UINT32_MAX ? 0xFE : cq_accuracy(error_ns);
 
-    ds->variance = 0xFFFF;
-    ds->priority2 = 128;
+    ds->variance = cc == 6 ? atomic_load(&g_quality_variance) : 0xffff;
+    ds->priority2 = g_settings.priority2;
     memcpy(ds->clock_id, g_clock_id, 8);
     ds->steps_removed = 0; /* we ARE the grandmaster of this dataset */
 }
@@ -1466,18 +1534,24 @@ static int l2tap_send_ptp(const void *ptp_payload, size_t ptp_len, struct timesp
     if (atomic_load(&g_emac_restarting))
         return -1;
 
-    size_t frame_len = 14 + ptp_len;
+    size_t frame_len = 14 + (g_settings.udp ? 28 : 0) + ptp_len;
 
-    /* No heap on the hot path. Largest frame we ever send is an Announce
-     * (14 + 64 = 78 bytes); 14 + 96 leaves comfortable headroom. */
-    uint8_t frame[14 + 96];
+    /* No heap on the hot path; reserve room for the transport headers and
+     * up to 96 bytes of PTP payload (Announce currently needs 64). */
+    uint8_t frame[14 + 28 + 96] = {0};
     if (frame_len > sizeof(frame))
         return -1;
     memcpy(frame, PTP_MCAST_MAC, 6);
     memcpy(frame + 6, g_src_mac, 6);
-    frame[12] = (ETH_TYPE_PTP >> 8) & 0xFF;
-    frame[13] = ETH_TYPE_PTP & 0xFF;
-    memcpy(frame + 14, ptp_payload, ptp_len);
+    if (g_settings.udp) {
+        esp_netif_ip_info_t ip;
+        if (esp_netif_get_ip_info(g_eth_netif, &ip) != ESP_OK || !ip.ip.addr) return -1;
+        ptp_ipv4_build(frame, ptp_payload, ptp_len, ip.ip.addr);
+    } else {
+        frame[12] = (ETH_TYPE_PTP >> 8) & 0xFF;
+        frame[13] = ETH_TYPE_PTP & 0xFF;
+        memcpy(frame + 14, ptp_payload, ptp_len);
+    }
 
     // Stack-allocated IREC buffer (as per official example)
     union
@@ -1613,6 +1687,12 @@ static void handle_announce(const uint8_t *payload, size_t len)
     announce_to_dataset(ann, &remote);
 
     g_last_announce_rx = time(NULL);
+    /* Honor the received cadence instead of assuming every peer sends at 2 s. */
+    int log = ann->hdr.log_msg_interval;
+    if (log >= -3 && log <= 4)
+        g_announce_timeout_sec = (3 * settings_interval_ms(log) + 999) / 1000;
+    else
+        g_announce_timeout_sec = ANNOUNCE_TIMEOUT_SEC;
 
     // ─────────────────────────────────────────────
     // Stability filter (clock identity based)
@@ -1754,7 +1834,7 @@ static void delay_resp_task(void *arg)
 
 #if LOG_LOCAL_LEVEL >= ESP_LOG_INFO
     /* Heartbeat throttle: aggregate Delay_Req counts and emit one INFO line
-     * per second. The state and the throttle block are wrapped in
+     * per configured interval (one minute by default). The throttle is wrapped in
      *   #if LOG_LOCAL_LEVEL >= ESP_LOG_INFO
      * so when INFO is disabled at compile time the function is identical
      * to its pre-heartbeat form — no timer read, no counter, no log call,
@@ -1775,7 +1855,7 @@ static void delay_resp_task(void *arg)
 #if LOG_LOCAL_LEVEL >= ESP_LOG_INFO
         since_last_log++;
         int64_t now_ms = esp_timer_get_time() / 1000;
-        if (now_ms - last_log_ms >= 1000)
+        if (now_ms - last_log_ms >= PTP_RX_LOG_INTERVAL_MS)
         {
             ESP_LOGI("PTP_RX", "Delay_Req: %lu in last %lld ms",
                      (unsigned long)since_last_log,
@@ -1818,7 +1898,7 @@ static void send_sync_and_followup(void)
 
     ptp_sync_msg_t sync = {0};
     build_ptp_header(&sync.hdr, PTP_MSG_SYNC, sizeof(ptp_sync_msg_t),
-                     seq, PTP_FLAG_TWO_STEP, 0, 0x00);
+                     seq, PTP_FLAG_TWO_STEP, g_settings.sync_log, 0x00);
 
     /* TX timestamp comes back synchronously in t1. ret <= 0 covers both the
      * explicit failure (-1) and the 0-bytes-accepted case: either way the
@@ -1831,13 +1911,18 @@ static void send_sync_and_followup(void)
     bool used_fallback = false;
     if (t1.tv_sec == 0 && t1.tv_nsec == 0)
     {
-        /* HW TX timestamp not delivered by the EMAC. Once PHC is at
-         * year-2026 wall-clock this should never legitimately happen;
-         * warn so a silent SW-fallback regression is visible. */
-        ESP_LOGW("PTP_TX", "Sync seq=%u: HW TX timestamp unavailable, using SW fallback",
-                 seq);
-        emac_get_time(&t1);
-        used_fallback = true;
+        if (g_settings.udp) {
+            ESP_LOGW("PTP_TX", "Sync seq=%u: no HW TX timestamp; suppressing Follow_Up", seq);
+            return;
+        } else {
+            /* HW TX timestamp not delivered by the EMAC. Once PHC is at
+             * year-2026 wall-clock this should never legitimately happen;
+             * warn so a silent SW-fallback regression is visible. */
+            ESP_LOGW("PTP_TX", "Sync seq=%u: HW TX timestamp unavailable, using SW fallback",
+                     seq);
+            emac_get_time(&t1);
+            used_fallback = true;
+        }
     }
 
     /* NOTE: a TX_TS diagnostic log used to live here. Removed: it ran
@@ -1852,7 +1937,7 @@ static void send_sync_and_followup(void)
 
     ptp_sync_msg_t fu = {0};
     build_ptp_header(&fu.hdr, PTP_MSG_FOLLOW_UP, sizeof(ptp_sync_msg_t),
-                     seq, 0, 0, 0x02);
+                     seq, 0, g_settings.sync_log, 0x02);
     encode_ptp_timestamp(&fu.origin_timestamp, &t1);
     l2tap_send_ptp(&fu, sizeof(fu), NULL);
 }
@@ -1896,7 +1981,7 @@ static void send_announce(void)
                      sizeof(ptp_announce_msg_t),
                      g_announce_seq++,
                      flags,
-                     1,
+                     g_settings.announce_log,
                      0x05);
 
     struct timespec now;
@@ -1904,10 +1989,10 @@ static void send_announce(void)
 
     encode_ptp_timestamp(&ann.origin_timestamp, &now);
 
-    // Clock quality (dynamic): 248 = never synchronized, 7 = holdover, 6 = locked
+    // Dynamic quality: 248 = never locked, 7 = in-budget, 187 = degraded, 6 = locked.
     ann.grandmaster_clock_class = cc;
-    ann.grandmaster_clock_accuracy = (cc == 6) ? 0x21 : (cc == 7) ? 0x23
-                                                                  : 0xFE;
+    uint32_t error_ns = atomic_load(&g_quality_error_ns);
+    ann.grandmaster_clock_accuracy = cc == 248 || error_ns == UINT32_MAX ? 0xFE : cq_accuracy(error_ns);
     /* time_source: GNSS (0x20) only when fully locked; INTERNAL_OSCILLATOR
      * (0xA0) in holdover and while never-synchronized. */
     ann.time_source = (cc == 6) ? 0x20 : 0xA0;
@@ -1915,13 +2000,15 @@ static void send_announce(void)
     // ✅ REQUIRED for ptp4l
     ann.current_utc_offset = htons(g_utc_offset);
 
-    ann.grandmaster_priority1 = 128;
-    ann.grandmaster_clock_variance = htons(0xFFFF);
-    ann.grandmaster_priority2 = 128;
+    ann.grandmaster_priority1 = g_settings.priority1;
+    ann.grandmaster_clock_variance = htons(cc == 6 ? atomic_load(&g_quality_variance) : 0xffff);
+    ann.grandmaster_priority2 = g_settings.priority2;
 
     memcpy(ann.grandmaster_identity, g_clock_id, 8);
 
-    l2tap_send_ptp(&ann, sizeof(ann), NULL);
+    if (l2tap_send_ptp(&ann, sizeof(ann), NULL) > 0)
+        atomic_store(&g_announced_quality, 0x10000U | ((uint32_t)cc << 8) |
+                     ann.grandmaster_clock_accuracy);
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
@@ -2037,6 +2124,55 @@ static void gnss_log_time_sentence(const char *source, const char *line,
              (unsigned long long)diag.edge_ticks, line);
 }
 
+/* Called only for checksum-verified time sentences, before publishing any
+ * date or PPS label. Logging is UART-task-side and throttled per source. */
+static bool gnss_check_date(const char *source, const char *line, time_t utc, int64_t rx_us)
+{
+    taskENTER_CRITICAL(&g_gnss_spinlock);
+    int64_t anchor_utc = g_gnss_trusted_utc, anchor_us = g_gnss_trusted_rx_us;
+    taskEXIT_CRITICAL(&g_gnss_spinlock);
+    int64_t expected, delta;
+    bool good = gnss_epoch_consistent((int64_t)utc, rx_us, anchor_utc, anchor_us, &expected, &delta);
+    gnss_date_diag_t *d = &g_gnss_date_diag[source[0] == 'R' ? 0 : 1];
+    if (!good) {
+        bool first = !d->rejecting;
+        if (first) { d->rejecting = true; d->bad_event = 0; d->first_bad_us = rx_us; }
+        d->bad_event++;
+        d->bad_total++;
+        if (first || rx_us - d->last_log_us >= 10000000LL) {
+            d->last_log_us = rx_us;
+            ESP_LOGE("GNSS_DATE", "%s REJECT checksum=1 utc=%lld expected=%lld delta_s=%lld "
+                     "whole_weeks=%lld remainder_s=%lld rx_us=%lld anchor_utc=%lld anchor_rx_us=%lld "
+                     "bad_event=%lu bad_total=%lu checksum_failures=%lu",
+                     source, (long long)utc, (long long)expected, (long long)delta,
+                     (long long)(delta / 604800), (long long)(delta % 604800),
+                     (long long)rx_us, (long long)anchor_utc, (long long)anchor_us,
+                     (unsigned long)d->bad_event, (unsigned long)d->bad_total,
+                     (unsigned long)d->checksum_failures);
+            if (first) {
+                for (unsigned i = 0; i < 2; ++i) {
+                    const gnss_date_diag_t *prev = &g_gnss_date_diag[i];
+                    if (prev->last_line[0])
+                        ESP_LOGW("GNSS_DATE", "previous %s checksum=%d parsed=%d raw=%s",
+                                 i ? "ZDA" : "RMC", prev->last_checksum, prev->last_parsed, prev->last_line);
+                }
+            }
+            ESP_LOGE("GNSS_DATE", "%s rejected raw=%s", source, line);
+        }
+        return false;
+    }
+    if (d->rejecting) {
+        ESP_LOGW("GNSS_DATE", "%s RECOVER utc=%lld expected=%lld delta_s=%lld "
+                 "duration_ms=%lld rejected_sentences=%lu bad_total=%lu checksum_failures=%lu raw=%s",
+                 source, (long long)utc, (long long)expected, (long long)delta,
+                 (long long)((rx_us - d->first_bad_us) / 1000),
+                 (unsigned long)d->bad_event, (unsigned long)d->bad_total,
+                 (unsigned long)d->checksum_failures, line);
+        d->rejecting = false;
+    }
+    return true;
+}
+
 static bool parse_zda(const char *line, int64_t rx_us)
 {
     int hh, mm, ss, day, mon, year;
@@ -2069,6 +2205,8 @@ static bool parse_zda(const char *line, int64_t rx_us)
     t.tm_sec = ss;
 
     time_t utc = my_timegm(&t);
+
+    if (!gnss_check_date("ZDA", line, utc, rx_us)) return false;
 
     /* Update GNSS time only if RMC has confirmed fix is valid.
      * ZDA alone does not indicate fix status (NMEA spec) — many modules
@@ -2160,6 +2298,8 @@ static bool parse_rmc(const char *line, int64_t rx_us)
     t.tm_sec = ss;
 
     time_t utc = my_timegm(&t);
+
+    if (!gnss_check_date("RMC", line, utc, rx_us)) return false;
 
     taskENTER_CRITICAL(&g_gnss_spinlock);
     g_gnss_seconds = utc;
@@ -2893,23 +3033,20 @@ static void pps_task(void *arg)
             portENTER_CRITICAL(&g_pps_capture_lock);
             cadence = g_pps_gate_report;
             portEXIT_CRITICAL(&g_pps_capture_lock);
-            uint64_t tick_delta = diag.edge_ticks - previous_label_ticks;
-            uint64_t tolerance = (uint64_t)cadence.period * PPS_CADENCE_GATE_US / 1000000ULL;
-            bool continuous = previous_label_ticks && diag.edge_ticks > previous_label_ticks &&
-                cadence.calibrated && tick_delta + tolerance >= cadence.period &&
-                tick_delta <= (uint64_t)cadence.period + tolerance &&
-                diag.isr_observed_us - previous_label_edge_us >= 900000 &&
-                diag.isr_observed_us - previous_label_edge_us <= 1100000;
+            int64_t elapsed_us = diag.isr_observed_us - previous_label_edge_us;
+            unsigned cadence_slots = pps_epoch_slots(previous_label_ticks, diag.edge_ticks,
+                cadence.period, PPS_CADENCE_GATE_US, cadence.calibrated, elapsed_us);
+            /* Bootstrap still needs adjacent labels. Only an established epoch
+             * can bridge missing pulses using the calibrated capture clock. */
+            unsigned elapsed_slots = epoch_confirmed && cadence_slots ? cadence_slots : 1;
             bool label_available = gnss_valid && diag.valid && label.rx_us;
             bool label_confirmed = label_available &&
-                previous_label_utc && label.utc == previous_label_utc + 1 &&
-                diag.isr_observed_us - previous_label_edge_us >= 900000 &&
-                diag.isr_observed_us - previous_label_edge_us <= 1100000;
+                pps_epoch_label_matches(previous_label_utc, label.utc, elapsed_slots, elapsed_us);
             /* Once confirmed, also require hardware continuity when a fresh
              * label arrives. A mismatch must never be concealed by coasting. */
-            if (epoch_confirmed && !continuous) label_confirmed = false;
-            bool coast = epoch_confirmed && continuous && gnss_valid && diag.valid &&
-                !label.rx_us && coast_seconds < PPS_LABEL_MAX_COAST_SECONDS;
+            if (epoch_confirmed && !cadence_slots) label_confirmed = false;
+            bool coast = epoch_confirmed && cadence_slots && gnss_valid && diag.valid &&
+                !label.rx_us && coast_seconds + cadence_slots <= PPS_LABEL_MAX_COAST_SECONDS;
             bool was_coasting = coast_seconds != 0;
             pps_label_reason_t label_reason = LABEL_OK;
             if (!gnss_valid) label_reason = LABEL_NO_FIX;
@@ -2917,16 +3054,20 @@ static void pps_task(void *arg)
             else if (!label.rx_us) label_reason = label_old ? LABEL_TOO_OLD :
                 label_close ? LABEL_TOO_CLOSE : label_future ? LABEL_POST_EDGE : LABEL_NO_MIDSECOND;
             else if (!previous_label_utc) label_reason = LABEL_WARMUP;
-            else if (label.utc != previous_label_utc + 1) label_reason = LABEL_UTC_SEQUENCE;
+            else if (label.utc != previous_label_utc + elapsed_slots) label_reason = LABEL_UTC_SEQUENCE;
             else if (!label_confirmed) label_reason = LABEL_PPS_INTERVAL;
             if (coast) {
-                label.utc = previous_label_utc + 1;
+                label.utc = previous_label_utc + cadence_slots;
                 label_confirmed = true;
                 label_reason = LABEL_COAST;
-                coast_seconds++;
+                coast_seconds += cadence_slots;
             } else {
                 coast_seconds = 0;
             }
+            if (epoch_confirmed && label_confirmed && cadence_slots > 1)
+                ESP_LOGW("PPS_EPOCH", "bridged %u missing PPS slot(s); elapsed=%u s utc=%lld source=%s",
+                         cadence_slots - 1, cadence_slots, (long long)label.utc,
+                         coast ? "bounded coast" : "fresh label");
             if ((epoch_confirmed && !label_confirmed) || coast || was_coasting ||
                 (label_confirmed && coast_seconds == 0 && !epoch_confirmed))
                 ESP_LOGI("PPS_EPOCH", "seq=%lu confirmed=%d coast=%u/%u reason=%s",
@@ -2938,6 +3079,13 @@ static void pps_task(void *arg)
             previous_label_ticks = diag.edge_ticks;
             uint64_t target_ns = label_confirmed ?
                 ((uint64_t)label.utc + 1ULL + (uint64_t)g_utc_offset) * 1000000000ULL : 0;
+
+            if (label_confirmed && !coast) {
+                taskENTER_CRITICAL(&g_gnss_spinlock);
+                g_gnss_trusted_utc = (int64_t)label.utc;
+                g_gnss_trusted_rx_us = label.rx_us;
+                taskEXIT_CRITICAL(&g_gnss_spinlock);
+            }
 
             taskENTER_CRITICAL(&g_servo_spinlock);
             g_last_pps_phc_ns = phc_ns;
@@ -3008,8 +3156,7 @@ static inline bool servo_phc_ioctl(uint32_t cmd, void *arg)
 {
     if (atomic_load(&g_emac_restarting))
         return false;
-    esp_eth_ioctl(g_eth_hndl, cmd, arg);
-    return true;
+    return esp_eth_ioctl(g_eth_hndl, cmd, arg) == ESP_OK;
 }
 
 static void servo_task(void *arg)
@@ -3030,19 +3177,23 @@ static void servo_task(void *arg)
     bool prev_holdover = false;
 
     static servo_state_t state = SERVO_UNLOCKED;
-    static int measure_count = 0;
-    static int64_t offset_acc = 0;
     static int acq_rail_streak = 0;  /* consecutive ACQUIRING samples beyond MAX_STEP_NS */
     static pps_fit_t acq_fit;
     static pps_fit_t candidate_fit;
     static pps_fit_t raw_fit;
     static unsigned fit_good_windows, quality_rejects;
     static int64_t last_clean_us;
+    int64_t quality_last_good_us = 0;
+    int64_t quality_last_log_us = 0;
     static int acq_sample_count = 0; /* accepted ACQUIRING samples since last transition */
+    static startup_slew_t startup_slew;
+    static bool startup_restore_pending;
+    static bool startup_seed_fit_attempted; /* One short attempt per boot. */
+    static bool startup_seed_validated;
+    static bool startup_short_verify_disabled;
     uint32_t pps_edges_at_holdover_entry = 0;
     int64_t lock_start_at_holdover_entry = 0; /* preserve lock duration across sentence-only outages */
 
-#define MEASURE_TICKS 5
 #define SERVO_INTEGRAL_LIMIT 2000000000.0
 
     while (1)
@@ -3072,7 +3223,20 @@ static void servo_task(void *arg)
         g_holdover = (last_clean_us && esp_timer_get_time() - last_clean_us > 5000000LL) || (time(NULL) - g_last_gnss_update > HOLDOVER_TIMEOUT_SEC) ||
                      !cur_gnss_valid || !gnss_pps_valid_snap;
 
-        if (g_holdover) { acq_fit.n = 0; fit_good_windows = 0; }
+        if (g_holdover) {
+            acq_fit.n = 0;
+            fit_good_windows = 0;
+            if (startup_seed_validated) startup_short_verify_disabled = true;
+        }
+        if (g_holdover || state != SERVO_LOCKED || !sample_clean) {
+            cq_gap(&g_clock_quality);
+            atomic_store(&g_quality_variance, 0xffff);
+        }
+        if ((g_holdover || state != SERVO_LOCKED) && quality_last_good_us) {
+            double age = (esp_timer_get_time() - quality_last_good_us) / 1e6;
+            double error = cq_error_ns(&g_clock_quality, age);
+            atomic_store(&g_quality_error_ns, (uint32_t)fmin(error, 4294967295.0));
+        }
         bool save_eligible = FREQUENCY_PERSIST_WRITES_ENABLED && state == SERVO_LOCKED && !g_holdover && llabs(g_last_offset) < 5000;
         if (atomic_exchange(&g_frequency_save_eligible, save_eligible) && !save_eligible)
             atomic_fetch_add(&g_frequency_save_epoch, 1);
@@ -3155,7 +3319,7 @@ static void servo_task(void *arg)
                 g_qual_raw_samples = 0;
 
                 /* PRESERVED (deliberately untouched): state, g_phc_stepped,
-                 * g_phc_residual_measured, g_gnss_pps_valid, g_integral,
+                 * g_gnss_pps_valid, g_integral,
                  * g_freq_ppb. */
 
                 if (state == SERVO_LOCKED)
@@ -3202,11 +3366,8 @@ static void servo_task(void *arg)
                 taskENTER_CRITICAL(&g_servo_spinlock);
                 g_phc_stepped = false;
                 taskEXIT_CRITICAL(&g_servo_spinlock);
-                g_phc_residual_measured = false;
                 g_integral = 0;
                 g_freq_ppb = 0;
-                measure_count = 0;
-                offset_acc = 0;
                 median_filter_reset();
                 avg_reset();
                 g_last_offset = 0;
@@ -3224,7 +3385,30 @@ static void servo_task(void *arg)
 
         prev_holdover = g_holdover;
 
-        if (!new_pps)
+        /* Do not leave the startup speed boost running across lost/dirty PPS,
+         * holdover or a MAC restart. Retry restoring base if ioctl is deferred. */
+        if (startup_slew.active && (g_holdover || state != SERVO_ACQUIRING ||
+            atomic_load(&g_emac_restarting) || (new_pps && !sample_clean) ||
+            esp_timer_get_time() - startup_slew.last_us > 1500000LL))
+            startup_restore_pending = true;
+        if (startup_restore_pending) {
+            startup_short_verify_disabled = true;
+            int32_t base = startup_slew.base_ppb;
+            if (servo_phc_ioctl(ETH_MAC_ESP_CMD_ADJ_PTP_TIME, &base)) {
+                g_freq_ppb = base;
+                atomic_store(&g_freq_ppb_hw, base);
+                startup_slew.active = false;
+                atomic_store(&g_startup_phase_active, false);
+                startup_restore_pending = false;
+                acq_fit.n = 0;
+                fit_good_windows = 0;
+                ESP_LOGW("STARTUP_PHASE", "aborted; restored base=%ld ppb; PTP remains disabled",
+                         (long)base);
+            }
+            continue;
+        }
+
+        if (g_holdover || !new_pps)
             continue;
 
         /* No confirmed epoch (fresh label or bounded PPS coast): freeze the servo. */
@@ -3259,9 +3443,8 @@ static void servo_task(void *arg)
             /* Fit residual drift relative to the adjustment actually applied,
              * including when reacquiring after a previous lock. */
             g_freq_ppb = (double)atomic_load(&g_freq_ppb_hw);
-            measure_count = 0;
-            offset_acc = 0;
             acq_rail_streak = 0;
+
             acq_sample_count = 0;
             g_integral = 0;
 
@@ -3316,6 +3499,43 @@ static void servo_task(void *arg)
 
             int64_t offset = (int64_t)pps - (int64_t)gnss_pps_snap;
 
+            if (startup_slew.active) {
+                startup_slew_t next = startup_slew;
+                int32_t command;
+                startup_slew_result_t result = startup_slew_step(&next, offset, sample_us, &command);
+                if (result == STARTUP_SLEW_ABORT) {
+                    startup_restore_pending = true;
+                    state = SERVO_UNLOCKED;
+                    ESP_LOGW("STARTUP_PHASE", "guard/timeout: phase=%lld ns; restoring base",
+                             (long long)offset);
+                    continue;
+                }
+                if (!servo_phc_ioctl(ETH_MAC_ESP_CMD_ADJ_PTP_TIME, &command)) {
+                    startup_restore_pending = true;
+                    continue;
+                }
+                startup_slew = next;
+                g_freq_ppb = command;
+                atomic_store(&g_freq_ppb_hw, command);
+                g_last_offset = offset;
+                ESP_LOGI("STARTUP_PHASE", "phase=%lld ns base=%ld extra=%ld applied=%ld ppb verify=%u/%u",
+                         (long long)offset, (long)next.base_ppb,
+                         (long)(command - next.base_ppb), (long)command,
+                         next.good, STARTUP_SLEW_VERIFY_SAMPLES);
+                if (result == STARTUP_SLEW_DONE) {
+                    atomic_store(&g_startup_phase_active, false);
+                    acq_fit.n = raw_fit.n = candidate_fit.n = 0;
+                    fit_good_windows = 0;
+                    avg_reset();
+                    median_filter_reset();
+                    atomic_store(&g_ptp_service_ready, true);
+                    ESP_LOGI("SERVO", "PTP service enabled after startup phase verification: "
+                             "phase=%lld ns base=%ld ppb; frequency lock pending",
+                             (long long)offset, (long)next.base_ppb);
+                }
+                continue; /* Never mix varying-rate startup samples into fits. */
+            }
+
             /* Sanity rail (MAX_STEP_NS). Never feed a beyond-rail sample to
              * ACQUIRE-A/B: a lone outlier (e.g. a PPS edge captured during
              * an EMAC restart window reads the PHC as ~0) is skipped, and a
@@ -3335,11 +3555,8 @@ static void servo_task(void *arg)
                              "— restarting acquisition from UNLOCKED");
                     acq_rail_streak = 0;
                     state = SERVO_UNLOCKED;
-                    g_phc_residual_measured = false;
                     g_integral = 0;
                     g_freq_ppb = 0;
-                    measure_count = 0;
-                    offset_acc = 0;
                     median_filter_reset();
                     avg_reset();
                     g_last_offset = 0;
@@ -3365,55 +3582,21 @@ static void servo_task(void *arg)
                          "inspect ACQUIRE-FIT spread, sample availability and drift",
                          acq_sample_count / 60);
 
-            if (!g_phc_residual_measured)
-            {
-                if (measure_count == 0)
-                {
-                    measure_count++;
-                    ESP_LOGW("SERVO",
-                             "ACQUIRE-A: discard first (%lld ns)",
-                             (long long)offset);
-                    continue;
-                }
-
-                offset_acc += offset;
-                measure_count++;
-
-                if (measure_count - 1 >= MEASURE_TICKS)
-                {
-                    int64_t avg_offset = offset_acc / MEASURE_TICKS;
-
-                    ESP_LOGW("SERVO",
-                             "ACQUIRE-A: avg offset=%lld ns → corrective step",
-                             (long long)avg_offset);
-
-                    struct timespec now_phc;
-                    emac_get_time(&now_phc);
-                    int64_t corrected_ns =
-                        (int64_t)now_phc.tv_sec * 1000000000LL +
-                        now_phc.tv_nsec - avg_offset;
-                    if (corrected_ns < 0)
-                        corrected_ns = 0;
-
-                    eth_mac_time_t t = {
-                        .seconds = (uint32_t)(corrected_ns / 1000000000ULL),
-                        .nanoseconds = (uint32_t)(corrected_ns % 1000000000ULL),
-                    };
-
-                    servo_phc_ioctl(ETH_MAC_ESP_CMD_S_PTP_TIME, &t);
-
-                    g_phc_residual_measured = true;
-                    measure_count = 0;
-                    offset_acc = 0;
-                }
-                continue;
-            }
-
-            /* Hold the actuator fixed while fitting a 32-second window.
+            /* Hold the actuator fixed while fitting. A validated loaded seed
+             * also permits two shorter, independent post-service checks.
              * Median long-baseline slopes resist isolated phase spikes. */
             double sample_t = sample_us / 1000000.0;
-            if (acq_fit.n && sample_t - acq_fit.t[0] > 40.0)
+            bool seed_fit = g_frequency_saved_valid && !startup_seed_fit_attempted &&
+                            !g_ever_locked && !atomic_load(&g_ptp_service_ready);
+            bool short_verify = startup_seed_validated && !startup_short_verify_disabled &&
+                                !g_ever_locked && atomic_load(&g_ptp_service_ready);
+            if (acq_fit.n && sample_t - acq_fit.t[0] > 40.0) {
                 acq_fit.n = 0;
+                fit_good_windows = 0;
+                startup_short_verify_disabled = true;
+                short_verify = false;
+            }
+            bool short_window = seed_fit || short_verify;
             if (acq_fit.n < PPS_FIT_CAPACITY)
             {
                 acq_fit.t[acq_fit.n] = sample_t;
@@ -3425,19 +3608,48 @@ static void servo_task(void *arg)
                 candidate_fit.n = acq_fit.n;
                 raw_fit.n = acq_fit.n;
             }
-            if (acq_fit.n < PPS_FIT_CAPACITY &&
-                sample_t - acq_fit.t[0] < 32.0)
+            if (acq_fit.n < (short_window ? STARTUP_SEED_FIT_SAMPLES : PPS_FIT_CAPACITY) &&
+                sample_t - acq_fit.t[0] < (short_window ? 16.0 : 32.0))
                 continue;
 
             pps_fit_result_t fit;
             unsigned fit_samples = acq_fit.n;
-            bool usable = pps_fit_evaluate(&acq_fit, &fit);
+            bool usable = short_window ? pps_fit_evaluate_seed(&acq_fit, &fit) :
+                                     pps_fit_evaluate(&acq_fit, &fit);
+            if (seed_fit) {
+                startup_seed_fit_attempted = true;
+                bool trusted = usable && fit.p90 <= STARTUP_SEED_MAX_P90_NS &&
+                    fit.inliers * 5 >= fit_samples * 4 &&
+                    fabs(fit.slope) <= STARTUP_SEED_MAX_DRIFT_PPB &&
+                    fabs(g_freq_ppb - g_frequency_saved_ppb) <= 1.0 &&
+                    fabs(fit.phase) <= STARTUP_SLEW_MAX_PHASE_NS;
+                ESP_LOGI("STARTUP_SEED", "%s samples=%u span=%.1f s drift=%.1f ppb p90=%.0f ns",
+                         trusted ? "validated" : "fallback to full fit",
+                         fit_samples, acq_fit.t[fit_samples - 1] - acq_fit.t[0],
+                         usable ? fit.slope : 0.0, usable ? fit.p90 : -1.0);
+                if (!trusted) continue; /* Keep existing samples and base rate. */
+                startup_seed_validated = true;
+            }
+            if (short_verify) {
+                bool trusted = usable && pps_fit_short_verify_ok(&fit, fit_samples);
+                ESP_LOGI("STARTUP_VERIFY", "%s samples=%u phase=%.0f ns drift=%.1f ppb p90=%.0f ns",
+                         trusted ? "short accepted" : "fallback to full windows",
+                         fit_samples, usable ? fit.phase : 0.0,
+                         usable ? fit.slope : 0.0, usable ? fit.p90 : -1.0);
+                if (!trusted) {
+                    startup_short_verify_disabled = true;
+                    fit_good_windows = 0;
+                    continue; /* Retain samples; do not change rate until full fit. */
+                }
+            }
             if (PPS_COMPARE_FITS)
             {
                 pps_fit_result_t corrected;
                 pps_fit_result_t raw;
-                bool raw_usable = pps_fit_evaluate(&raw_fit, &raw);
-                bool candidate_usable = pps_fit_evaluate(&candidate_fit, &corrected);
+                bool raw_usable = short_window ? pps_fit_evaluate_seed(&raw_fit, &raw) :
+                                            pps_fit_evaluate(&raw_fit, &raw);
+                bool candidate_usable = short_window ? pps_fit_evaluate_seed(&candidate_fit, &corrected) :
+                                                  pps_fit_evaluate(&candidate_fit, &corrected);
                 if (raw_usable && candidate_usable)
                 {
                     double delay_sum = 0, delay_min = 1e30, delay_max = -1e30;
@@ -3475,7 +3687,9 @@ static void servo_task(void *arg)
                 ESP_LOGW("SERVO", "ACQUIRE-FIT: noisy window p90=%.0f ns; holding frequency", fit.p90);
                 continue;
             }
-            /* Align phase once, while PTP service is still closed. */
+            /* Estimate base frequency once before startup phase recovery.
+             * Normal residuals need only the fine slew, avoiding another
+             * PHC rewrite and its read-to-write latency. */
             if (!atomic_load(&g_ptp_service_ready) && !g_ever_locked)
             {
                 double initial = g_freq_ppb - fit.slope;
@@ -3485,22 +3699,30 @@ static void servo_task(void *arg)
                 if (!servo_phc_ioctl(ETH_MAC_ESP_CMD_ADJ_PTP_TIME, &initial_ppb)) continue;
                 g_freq_ppb = initial_ppb;
                 atomic_store(&g_freq_ppb_hw, initial_ppb);
-                struct timespec now;
-                emac_get_time(&now);
-                int64_t aligned_ns = (int64_t)now.tv_sec * 1000000000LL + now.tv_nsec - (int64_t)fit.phase;
-                if (aligned_ns < 0) continue;
-                eth_mac_time_t aligned = {
-                    .seconds = (uint32_t)(aligned_ns / 1000000000LL),
-                    .nanoseconds = (uint32_t)(aligned_ns % 1000000000LL),
-                };
-                if (!servo_phc_ioctl(ETH_MAC_ESP_CMD_S_PTP_TIME, &aligned)) continue;
+                /* A missing/very poor seed can accumulate milliseconds while
+                 * the full fit runs. Keep the bounded fine slew for small
+                 * errors: coarse-align large errors only with service closed,
+                 * then let fresh PPS measurements remove write latency. */
+                if (fabs(fit.phase) > STARTUP_SLEW_MAX_PHASE_NS) {
+                    struct timespec now;
+                    emac_get_time(&now);
+                    int64_t aligned_ns = (int64_t)now.tv_sec * 1000000000LL +
+                                         now.tv_nsec - (int64_t)fit.phase;
+                    if (aligned_ns < 0) continue;
+                    eth_mac_time_t aligned = {
+                        .seconds = (uint32_t)(aligned_ns / 1000000000LL),
+                        .nanoseconds = (uint32_t)(aligned_ns % 1000000000LL),
+                    };
+                    if (!servo_phc_ioctl(ETH_MAC_ESP_CMD_S_PTP_TIME, &aligned)) continue;
+                    ESP_LOGW("STARTUP_PHASE", "coarse-aligned large phase %.0f ns before fine slew; PTP disabled",
+                             fit.phase);
+                }
+                atomic_store(&g_startup_phase_active, true);
+                startup_slew_begin(&startup_slew, initial_ppb, sample_us);
                 fit_good_windows = 0;
-                avg_reset();
-                median_filter_reset();
-                g_last_offset = 0;
-                atomic_store(&g_ptp_service_ready, true);
-                ESP_LOGI("SERVO", "PTP service enabled after initial fit: drift=%.1f ppb phase=%.0f ns adj=%ld ppb; lock pending",
-                         fit.slope, fit.phase, (long)initial_ppb);
+                ESP_LOGI("STARTUP_PHASE", "begin after initial fit: drift=%.1f ppb phase=%.0f ns "
+                         "base=%ld ppb limit=%d ppb; PTP disabled",
+                         fit.slope, fit.phase, (long)initial_ppb, STARTUP_SLEW_LIMIT_PPB);
                 continue;
             }
             /* ns/s == ppb. Slow phase recovery (120 s) plus measured drift.
@@ -3515,6 +3737,7 @@ static void servo_task(void *arg)
             if (!servo_phc_ioctl(ETH_MAC_ESP_CMD_ADJ_PTP_TIME, &adj_acq_ppb))
             {
                 fit_good_windows = 0;
+                startup_short_verify_disabled = true;
                 continue;
             }
             g_freq_ppb = adj_acq_ppb;
@@ -3575,6 +3798,20 @@ static void servo_task(void *arg)
         case SERVO_LOCKED:
         {
             int64_t raw_offset = (int64_t)pps - (int64_t)gnss_pps_snap;
+            /* A locked clock cannot legitimately jump an entire second.
+             * Apply this before warm-up bypasses the normal outlier gate:
+             * otherwise huge epochs overflow the average and poison I/D. */
+            if (raw_offset < -1000000000LL || raw_offset > 1000000000LL) {
+                static int64_t last_epoch_reject_us;
+                int64_t now_us = esp_timer_get_time();
+                if (!last_epoch_reject_us || now_us - last_epoch_reject_us >= 10000000LL) {
+                    ESP_LOGE("SERVO", "Epoch sanity reject: offset=%lld ns; preserving frequency and filters",
+                             (long long)raw_offset);
+                    last_epoch_reject_us = now_us;
+                }
+                g_total_rejects++;
+                continue;
+            }
 
 #define HARD_REJECT_NS 100000LL /* 100 µs */
             int64_t reference = (g_avg_count > 0)
@@ -3623,11 +3860,8 @@ static void servo_task(void *arg)
                              (long long)reference,
                              (long long)raw_offset);
                     state = SERVO_UNLOCKED;
-                    g_phc_residual_measured = false;
                     g_integral = 0;
                     g_freq_ppb = 0;
-                    measure_count = 0;
-                    offset_acc = 0;
                     median_filter_reset();
                     avg_reset();
                     g_last_offset = 0;
@@ -3642,6 +3876,30 @@ static void servo_task(void *arg)
             }
 
             g_consecutive_rejects = 0; /* accepted sample breaks the streak */
+
+            if (!g_holdover) {
+                cq_sample(&g_clock_quality, (int64_t)(gnss_pps_snap / 1000000000ULL),
+                          (double)raw_offset, atomic_load(&g_freq_ppb_hw));
+                quality_last_good_us = sample_us;
+                atomic_store(&g_quality_variance, g_clock_quality.variance);
+                atomic_store(&g_quality_error_ns, (uint32_t)fmin(
+                    g_clock_quality.initial_error, 4294967295.0));
+                atomic_store(&g_quality_history_minutes, g_clock_quality.count);
+                atomic_store(&g_quality_holdover_60s_ns, (uint32_t)fmin(
+                    cq_error_ns(&g_clock_quality, 60), 4294967295.0));
+                atomic_store(&g_quality_holdover_1h_ns, (uint32_t)fmin(
+                    cq_error_ns(&g_clock_quality, 3600), 4294967295.0));
+                if (sample_us - quality_last_log_us >= 60000000LL) {
+                    quality_last_log_us = sample_us;
+                    ESP_LOGI("CLOCK_QUALITY", "variance=0x%04x samples=%u history_minutes=%u "
+                             "trials[60,300,900,3600]=%u,%u,%u,%u holdover_60s=%.0f ns holdover_1h=%.0f ns",
+                             g_clock_quality.variance, g_clock_quality.variance_count,
+                             g_clock_quality.count, g_clock_quality.trials[0],
+                             g_clock_quality.trials[1], g_clock_quality.trials[2],
+                             g_clock_quality.trials[3], cq_error_ns(&g_clock_quality, 60),
+                             cq_error_ns(&g_clock_quality, 3600));
+                }
+            }
 
             int64_t evicted = (g_avg_count == AVG_WINDOW)
                                   ? g_avg_ring[g_avg_idx]
@@ -3705,6 +3963,13 @@ static void servo_task(void *arg)
             /* Integral-only term estimates oscillator frequency, excluding
              * the proportional and derivative phase correction terms. */
             atomic_store(&g_frequency_learned_ppb, (int32_t)(-SERVO_KI_SLOW * g_integral));
+            servo_tuning_record((servo_tuning_sample_t){
+                .sample_us = sample_us, .raw_ns = raw_offset, .avg_ns = offset,
+                .adj_ppb = atomic_load(&g_freq_ppb_hw),
+                .p_ppb = -SERVO_KP_SLOW * (double)offset,
+                .i_ppb = -SERVO_KI_SLOW * g_integral,
+                .d_ppb = -(SERVO_KD_ENABLE ? SERVO_KD_SLOW : 0.0) * d_term,
+            });
 #define LOCK_LOSS_AVG_COUNT 60
             static int avg_bad_count = 0;
 
@@ -3718,11 +3983,8 @@ static void servo_task(void *arg)
                              "Full re-acquire.",
                              (long long)LOCK_LOSS_AVG_NS, avg_bad_count);
                     state = SERVO_UNLOCKED;
-                    g_phc_residual_measured = false;
                     g_integral = 0;
                     g_freq_ppb = 0;
-                    measure_count = 0;
-                    offset_acc = 0;
                     median_filter_reset();
                     avg_reset();
                     g_last_offset = 0;
@@ -4130,7 +4392,15 @@ static void ptp_rx_task(void *arg)
         if (eth_len < 14 + sizeof(ptp_header_t))
             goto timeout_check;
 
-        const ptp_header_t *rx_hdr = (const ptp_header_t *)(eth_frame + 14);
+        size_t offset = 14, payload_len = eth_len - 14;
+        if (g_settings.udp) {
+            if (!ptp_ipv4_parse(eth_frame, eth_len, &offset, &payload_len)) goto timeout_check;
+        }
+        if (payload_len < sizeof(ptp_header_t)) goto timeout_check;
+        const ptp_header_t *rx_hdr = (const ptp_header_t *)(eth_frame + offset);
+        size_t message_len = ntohs(rx_hdr->msg_length);
+        if (message_len < sizeof(ptp_header_t) || message_len > payload_len) goto timeout_check;
+        payload_len = message_len;
 
         /* Accept only PTPv2 frames in OUR domain. versionPTP is the low
          * nibble of its byte (majorVersion); the high nibble is v2.1's
@@ -4142,7 +4412,7 @@ static void ptp_rx_task(void *arg)
             rx_hdr->domain_number != PTP_DOMAIN)
             goto timeout_check;
 
-        uint8_t msg_type = eth_frame[14] & 0x0F;
+        uint8_t msg_type = eth_frame[offset] & 0x0F;
 
         // ESP_LOGD("PTP_RX", "Type 0x%X @ %lld.%09ld",
         //          msg_type,
@@ -4164,11 +4434,14 @@ static void ptp_rx_task(void *arg)
              * Snapshot + enqueue only; delay_resp_task builds and sends.
              * No logging on the receive hot path. */
             if (g_i_am_master && atomic_load(&g_ptp_service_ready))
-                enqueue_delay_req(eth_frame + 14, eth_len - 14, &hw_ts);
+            {
+                if (hw_ts.tv_sec || hw_ts.tv_nsec)
+                    enqueue_delay_req(eth_frame + offset, payload_len, &hw_ts);
+            }
             break;
 
         case PTP_MSG_ANNOUNCE:
-            handle_announce(eth_frame + 14, eth_len - 14);
+            handle_announce(eth_frame + offset, payload_len);
             break;
 
         default:
@@ -4182,7 +4455,7 @@ static void ptp_rx_task(void *arg)
         if (!g_i_am_master)
         {
             time_t now = time(NULL);
-            if ((now - g_last_announce_rx) > ANNOUNCE_TIMEOUT_SEC)
+            if ((now - g_last_announce_rx) > g_announce_timeout_sec)
             {
                 g_i_am_master = true;
             }
@@ -4195,6 +4468,7 @@ static void ptp_rx_task(void *arg)
 static void ptp_tx_task(void *arg)
 {
     TickType_t wake = xTaskGetTickCount();
+    unsigned fractional_ticks = 0;
 
     while (1)
     {
@@ -4213,7 +4487,13 @@ static void ptp_tx_task(void *arg)
             }
         }
 
-        vTaskDelayUntil(&wake, pdMS_TO_TICKS(PTP_SYNC_INTERVAL_MS));
+        /* At 100 Hz, 125 ms is 12.5 ticks. Alternate 12/13 ticks so the
+         * mean cadence matches the announced interval instead of 120 ms. */
+        unsigned tick_millis = PTP_SYNC_INTERVAL_MS * configTICK_RATE_HZ;
+        fractional_ticks += tick_millis % 1000;
+        TickType_t delay_ticks = tick_millis / 1000 + fractional_ticks / 1000;
+        fractional_ticks %= 1000;
+        vTaskDelayUntil(&wake, delay_ticks ? delay_ticks : 1);
         // ESP_LOGW("PTP_TX_TASK", "PTP TX task is working");
     }
 }
@@ -4395,6 +4675,9 @@ static void emac_restart_preserve_phc(void)
         /* ── Step 4: Re-enable PTP ── */
         bool ptp_en = true;
         esp_eth_ioctl(g_eth_hndl, ETH_MAC_ESP_CMD_PTP_ENABLE, &ptp_en);
+        if (g_settings.udp) {
+            EMAC_PTP.timestamp_ctrl.en_proc_ptp_ipv4_udp = 1;
+        }
 
         /* Brief delay to let PHC start ticking */
         vTaskDelay(pdMS_TO_TICKS(20));
@@ -5031,11 +5314,11 @@ static void render_screen_servo(void)
     if (!g_ever_locked)
         disp_cc = 248;
     else if (g_holdover)
-        disp_cc = 7;
+        disp_cc = atomic_load(&g_quality_error_ns) > CQ_HOLDOVER_SPEC_NS ? 187 : 7;
     else if (!g_settled_after_holdover &&
              (g_lock_acquired_ms == 0 ||
               (now_ms - g_lock_acquired_ms) < POST_HOLDOVER_SETTLE_MS))
-        disp_cc = 7; /* not-yet-settled: never-acquired-this-cycle, or inside settle window */
+        disp_cc = atomic_load(&g_quality_error_ns) > CQ_HOLDOVER_SPEC_NS ? 187 : 7;
     else
         disp_cc = 6;
 
@@ -5400,12 +5683,45 @@ static void render_screen_timing_cfg(void)
  * timing_core_bringup() and does NOT depend on a link.
  * ═════════════════════════════════════════════════════════════════════════ */
 
+static void ptp_udp_join(const esp_netif_ip_info_t *ip)
+{
+    /* Retain IGMP membership for multicast snooping switches. */
+    static int fd = -1;
+    if (fd >= 0) close(fd);
+    fd = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    struct ip_mreq membership = {0};
+    membership.imr_multiaddr.s_addr = inet_addr("224.0.1.129");
+    membership.imr_interface.s_addr = ip->ip.addr;
+    if (fd < 0 || setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP,
+                            &membership, sizeof(membership)) != 0)
+        ESP_LOGE(TAG, "PTP multicast join failed: errno=%d", errno);
+}
+
+static esp_err_t ptp_udp_input(esp_eth_handle_t eth, uint8_t *buffer,
+                               uint32_t length, void *priv, void *info)
+{
+    size_t offset, payload_len;
+    if (ptp_ipv4_parse(buffer, length, &offset, &payload_len)) {
+        if (atomic_load(&g_l2tap_ready)) {
+            size_t remaining = length;
+            esp_err_t err = esp_vfs_l2tap_eth_filter_frame(eth, buffer, &remaining, info);
+            if (!remaining) return err; /* L2TAP owns the buffer. */
+        }
+        free(buffer);
+        return ESP_OK;
+    }
+    return esp_netif_receive((esp_netif_t *)priv, buffer, length, NULL);
+}
+
 static void ip_event_handler(void *arg, esp_event_base_t base,
                              int32_t id, void *data)
 {
     if (id == IP_EVENT_ETH_GOT_IP)
     {
         ip_event_got_ip_t *event = (ip_event_got_ip_t *)data;
+        if (g_settings.udp) {
+            ptp_udp_join(&event->ip_info);
+        }
         const char *source = g_static_applied ? "Static" : "DHCP";
         ESP_LOGI("IP", "%s got IP: " IPSTR ", GW: " IPSTR ", Mask: " IPSTR,
                  source,
@@ -5433,9 +5749,9 @@ static void apply_static_ip(esp_netif_t *netif)
     }
 
     esp_netif_ip_info_t ip = {
-        .ip.addr = STATIC_IP_ADDR,
-        .netmask.addr = STATIC_IP_NETMASK,
-        .gw.addr = STATIC_IP_GATEWAY,
+        .ip.addr = inet_addr(g_settings.ip),
+        .netmask.addr = inet_addr(g_settings.netmask),
+        .gw.addr = inet_addr(g_settings.gateway),
     };
 
     err = esp_netif_set_ip_info(netif, &ip);
@@ -5488,6 +5804,11 @@ static void dhcp_fallback_task(void *arg)
             vTaskDelay(pdMS_TO_TICKS(500));
         }
 
+        if (g_settings.network_mode == 1) {
+            apply_static_ip(g_eth_netif);
+            xSemaphoreTake(g_link_down_sem, portMAX_DELAY);
+            continue;
+        }
         /* 2. (Re)start DHCP. If it was never stopped this returns ALREADY_STARTED,
          *    which is fine. If a previous cycle fell back to static, this is what
          *    actually re-enables DHCP — the whole point of the fix. */
@@ -5509,7 +5830,7 @@ static void dhcp_fallback_task(void *arg)
         }
         else
         {
-            apply_static_ip(g_eth_netif);
+            if (g_settings.network_mode == 0) apply_static_ip(g_eth_netif);
         }
 
         /* 5. Block until the link drops — zero CPU between link events (no
@@ -5595,7 +5916,8 @@ static void on_link_up(void)
              g_src_mac[0], g_src_mac[1], g_src_mac[2],
              g_src_mac[3], g_src_mac[4], g_src_mac[5]);
 
-    uint8_t ptp_mcast_all[6] = {0x01, 0x1B, 0x19, 0x00, 0x00, 0x00};
+    uint8_t ptp_mcast_all[6];
+    memcpy(ptp_mcast_all, PTP_MCAST_MAC, sizeof(ptp_mcast_all));
     esp_err_t ferr = esp_eth_ioctl(g_eth_hndl, ETH_CMD_ADD_MAC_FILTER, ptp_mcast_all);
     if (ferr == ESP_OK)
         ESP_LOGI(TAG, "PTP multicast filter added");
@@ -5675,18 +5997,24 @@ static esp_err_t ethernet_init(void)
 
     bool ptp_en = true;
     esp_eth_ioctl(g_eth_hndl, ETH_MAC_ESP_CMD_PTP_ENABLE, &ptp_en);
+    if (g_settings.udp) {
+        EMAC_PTP.timestamp_ctrl.en_proc_ptp_ipv4_udp = 1;
+    }
 
     /* Netif glue is required so L2TAP RX path is wired up. */
     esp_netif_config_t netif_cfg = ESP_NETIF_DEFAULT_ETH();
     g_eth_netif = esp_netif_new(&netif_cfg);
-    esp_netif_attach(g_eth_netif, esp_eth_new_netif_glue(g_eth_hndl));
+    ESP_ERROR_CHECK(esp_netif_attach(g_eth_netif, esp_eth_new_netif_glue(g_eth_hndl)));
+    if (g_settings.udp) {
+        ESP_ERROR_CHECK(esp_eth_update_input_path_info(g_eth_hndl, ptp_udp_input, g_eth_netif));
+    }
     /* DHCP client is started automatically by ESP_NETIF_DEFAULT_ETH. */
 
     /* Select the configured identity before the OLED starts. The netif
      * hostname is applied after esp_eth_start() in app_main. */
-    if (DEVICE_HOSTNAME[0])
+    if (g_settings.hostname[0])
     {
-        snprintf(g_hostname, sizeof g_hostname, "%s", DEVICE_HOSTNAME);
+        snprintf(g_hostname, sizeof g_hostname, "%s", g_settings.hostname);
         /* The display fits 21 characters per row. Split arbitrary custom
          * names without requiring the generated four-token format. */
         snprintf(g_host_line1, sizeof g_host_line1, "%.21s", g_hostname);
@@ -5751,13 +6079,15 @@ static esp_err_t l2tap_init(void)
         ESP_LOGI(TAG, "Timestamp EN: OK");
     }
 
-    uint16_t eth_type = ETH_TYPE_PTP;
+    uint16_t eth_type = g_settings.udp ? 0x0800 : ETH_TYPE_PTP;
     if (ioctl(g_l2tap_fd, L2TAP_S_RCV_FILTER, &eth_type) < 0)
     {
         ESP_LOGE(TAG, "L2TAP_S_RCV_FILTER failed: %s", strerror(errno));
         return ESP_FAIL;
     }
     ESP_LOGI(TAG, "RCV filter set to 0x%04X", eth_type);
+    ESP_LOGI(TAG, "PTP transport: %s",
+             g_settings.udp ? "UDP/IPv4 multicast E2E (224.0.1.129)" : "Layer-2 Ethernet E2E");
 
     return ESP_OK;
 }
@@ -5774,6 +6104,9 @@ static bool phc_start_blocking(void)
 
         en = true;
         esp_eth_ioctl(g_eth_hndl, ETH_MAC_ESP_CMD_PTP_ENABLE, &en);
+        if (g_settings.udp) {
+            EMAC_PTP.timestamp_ctrl.en_proc_ptp_ipv4_udp = 1;
+        }
         vTaskDelay(pdMS_TO_TICKS(20));
 
         struct timespec t1, t2;
@@ -5909,6 +6242,10 @@ static void timing_config_error_cb(const char *failed_step_name)
 
 void app_main(void)
 {
+    settings_load();
+    const uint8_t l2_mac[6] = {1, 0x1b, 0x19, 0, 0, 0};
+    const uint8_t udp_mac[6] = {1, 0, 0x5e, 0, 1, 0x81};
+    memcpy(PTP_MCAST_MAC, g_settings.udp ? udp_mac : l2_mac, 6);
     // If your loggin is not working (nothing is being produced at serial output), look at sdkconfig.defaults to know why
     // and re-enable it, if desired
     esp_log_level_set("*", ESP_LOG_INFO);

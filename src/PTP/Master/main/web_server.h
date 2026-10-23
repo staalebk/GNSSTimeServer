@@ -325,8 +325,14 @@ static esp_err_t status_handler(httpd_req_t *req)
     /* Heap leak delta: we don't track baseline here -- the heap_monitor task
      * tracks it internally. Report 0 (unknown) and the UI shows "+0 B / ok". */
 
+    uint32_t announced_quality = atomic_load(&g_announced_quality);
     off = web_append(buf, BUF_SZ, off,
         "{"
+        "\"ptp_udp_ipv4\":%s,"
+        "\"ptp_domain\":%u,"
+        "\"announce_sent\":%s,"
+        "\"clock_class\":%u,"
+        "\"clock_accuracy\":%u,"
         "\"chip\":\"ESP32-P4\","
         "\"chip_rev\":\"v%d.%d\","
         "\"cpu_mhz\":%d,"
@@ -352,7 +358,7 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"link_up\":%s,"
         "\"l2tap_ready\":%s,"
         "\"ip\":\"%s\","
-        "\"ip_source\":\"DHCP/static\","
+        "\"ip_source\":\"%s\","
         "\"mac\":\"%s\","
         "\"hostname\":\"%s\","
         "\"emac_restarts\":%" PRIu32 ","
@@ -362,12 +368,17 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"clock_id\":\"%s\","
         "\"utc_time\":\"%s\","
         "\"tai_offset\":%d,"
-        "\"sync_interval_ms\":1000,"
-        "\"announce_interval_ms\":2000,"
+        "\"sync_interval_ms\":%u,"
+        "\"announce_interval_ms\":%u,"
         "\"sync_seq\":%u,"
         "\"announce_seq\":%u,"
         "\"path_delay_ns\":null,"
         "\"slaves_active\":%d,"
+        "\"offset_scaled_log_variance\":%u,"
+        "\"estimated_error_ns\":%lu,"
+        "\"quality_history_minutes\":%lu,"
+        "\"estimated_holdover_60s_ns\":%lu,"
+        "\"estimated_holdover_1h_ns\":%lu,"
         "\"slaves_max\":8,"
         "\"servo_state\":\"%s\","
         "\"locked_for\":\"%s\","
@@ -387,6 +398,11 @@ static esp_err_t status_handler(httpd_req_t *req)
         "\"gnss_fix\":%s,"
         "\"pps_led_active\":%s,"
         "\"tasks\":[",
+        g_settings.udp ? "true" : "false",
+        (unsigned)PTP_DOMAIN,
+        announced_quality ? "true" : "false",
+        (unsigned)((announced_quality >> 8) & 0xff),
+        (unsigned)(announced_quality & 0xff),
         chip.revision / 100, chip.revision % 100,
         (int)WEB_CPU_MHZ,
         app ? app->project_name : "PTP_Master",
@@ -403,6 +419,7 @@ static esp_err_t status_handler(httpd_req_t *req)
         link_up     ? "true" : "false",
         l2tap_ready ? "true" : "false",
         ip_str,
+        g_static_applied ? (g_settings.network_mode == 1 ? "Static" : "Static fallback") : "DHCP",
         mac_str,
         g_hostname[0] ? g_hostname : "",
         emac_rst,
@@ -410,9 +427,16 @@ static esp_err_t status_handler(httpd_req_t *req)
         clk_str,
         utc_str,
         tai_off,
+        PTP_SYNC_INTERVAL_MS,
+        PTP_ANNOUNCE_INTERVAL_MS,
         (unsigned)sync_seq,
         (unsigned)ann_seq,
         slaves,
+        (unsigned)atomic_load(&g_quality_variance),
+        (unsigned long)atomic_load(&g_quality_error_ns),
+        (unsigned long)atomic_load(&g_quality_history_minutes),
+        (unsigned long)atomic_load(&g_quality_holdover_60s_ns),
+        (unsigned long)atomic_load(&g_quality_holdover_1h_ns),
         web_state_str(st),
         locked_for,
         (long long)offset_ns,
@@ -621,13 +645,13 @@ static esp_err_t health_handler(httpd_req_t *req)
         "\"uptime_s\":%lld,"
         "\"runtime_stats\":%s,"
         "\"heap\":{\"free\":%u,\"min\":%u,\"lfb\":%u},"
-        "\"sync_jitter\":{\"nominal_us\":1000000,\"window\":%" PRIu32 ",\"count\":%" PRIu32 ","
+        "\"sync_jitter\":{\"nominal_us\":%u,\"window\":%" PRIu32 ",\"count\":%" PRIu32 ","
             "\"last_us\":%lld,\"min_us\":%lld,\"max_us\":%lld,\"mean_us\":%lld,\"p2p_us\":%lld},"
         "\"tasks\":[",
         (long long)uptime_s,
         have_cpu ? "true" : "false",
         (unsigned)heap_free, (unsigned)heap_min, (unsigned)heap_lfb,
-        sj_win, sj_count,
+        PTP_SYNC_INTERVAL_MS * 1000U, sj_win, sj_count,
         (long long)sj_last, (long long)sj_min, (long long)sj_max, (long long)sj_mean,
         (long long)(sj_win ? (sj_max - sj_min) : 0));
 
@@ -701,6 +725,8 @@ static esp_err_t ota_page_handler(httpd_req_t *req)
  *
  *  Returns the handle for advanced use, or NULL on failure.
  * --------------------------------------------------------------------------- */
+#include "settings_web.h"
+
 static httpd_handle_t web_server_start(void)
 {
     history_start();
@@ -713,7 +739,7 @@ static httpd_handle_t web_server_start(void)
     config.server_port      = 80;
     config.ctrl_port        = 32768;        /* default; explicit for clarity */
     config.max_open_sockets = 4;            /* page + a few XHRs */
-    config.max_uri_handlers = 8;            /* room for OTA routes */
+    config.max_uri_handlers = 12;            /* room for OTA routes */
     config.stack_size       = 8192;         /* OTA needs slightly more stack */
     config.lru_purge_enable = true;
     config.recv_wait_timeout = 30;          /* OTA: large uploads can pause */
@@ -727,6 +753,14 @@ static httpd_handle_t web_server_start(void)
         return NULL;
     }
 
+    static const httpd_uri_t settings_routes[] = {
+        {.uri="/settings", .method=HTTP_GET, .handler=settings_page_handler},
+        {.uri="/api/settings", .method=HTTP_GET, .handler=settings_get_handler},
+        {.uri="/api/settings", .method=HTTP_POST, .handler=settings_post_handler},
+        {.uri="/api/settings/action", .method=HTTP_POST, .handler=settings_action_handler},
+    };
+    for (unsigned i = 0; i < sizeof(settings_routes)/sizeof(settings_routes[0]); i++)
+        ESP_ERROR_CHECK(httpd_register_uri_handler(server, &settings_routes[i]));
     static const httpd_uri_t uri_root = {
         .uri      = "/",
         .method   = HTTP_GET,

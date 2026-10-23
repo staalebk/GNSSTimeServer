@@ -1,5 +1,146 @@
 # PPS hardware capture experiment
 
+## Short missed-PPS gaps
+
+An established PPS epoch can bridge intervals of two or three seconds (one or
+two missing pulses). The calibrated GPTimer must match that integer interval
+within the existing cadence gate, the monotonic ISR timestamp must agree within
+100 ms, and any fresh NMEA label must advance by exactly the same number of
+seconds. Bootstrap still requires adjacent labels. Missing labels can use the
+existing bounded coast, with all elapsed seconds charged against its five-second
+budget. Inconsistent labels and longer gaps retain the previous recovery policy.
+
+Successful bridging logs `PPS_EPOCH: bridged ... missing PPS slot(s)` and keeps
+the servo frequency, phase filters and lock/settling timestamps intact. The
+ordinary five-second clean-sample timeout remains active; this change does not
+invent measurements for missing pulses. Clock-quality statistics still detect
+nonconsecutive samples independently. `tools/test-pps-epoch.c` covers normal and
+missing pulses, tolerance boundaries, uncalibrated timing and mismatched labels.
+
+## Startup phase slew before serving PTP
+
+Updated startup: the preliminary discard-plus-five-sample absolute PHC rewrite
+has been removed. The first clean PPS after the coarse epoch setting starts
+frequency fitting. With a valid loaded NVS seed, startup makes one 16-sample
+validation attempt (or evaluates available samples after 16 seconds). It needs
+at least 12 clean samples spanning 14 seconds, retains >=8-second pair slopes,
+requires p90 <=500 ns and >=80% inliers within 500 ns, and accepts only residual
+drift <=200 ppb while the applied rate still matches the saved seed within
+1 ppb. Phase must also fit inside the +/-200 us fine-slew guard. Logs identify
+`STARTUP_SEED validated` or `fallback to full fit`. A failed attempt keeps the
+existing samples, holds the seed fixed and continues to the ordinary full fit.
+Only one short attempt is allowed per boot; no seed means the full fit.
+
+The fine slew now uses `extra_ppb = -phase_ns` (one-second recovery target),
+still capped at +/-20 ppm. It enters base-rate verification inside +/-250 ns
+and accepts the next three samples inside +/-500 ns. This hysteresis avoids
+restarting verification on a marginal crossing of the outer boundary. Software
+regression vectors align ideal +/-32 us errors and verify them in six PPS
+updates. After a successful seed validation, the two independent post-service
+lock-verification windows now collect 16 samples each (or evaluate after 16 s).
+Each needs >=12 samples spanning >=14 s, p90 <=500 ns, >=80% inliers within
+500 ns, absolute phase <1 us and absolute drift <100 ppb. A failed check keeps
+its samples and holds the actuator unchanged while extending to a full window;
+both full verification windows must then pass. Holdover, a startup slew abort,
+an expired fit window or a failed verification frequency command also disables
+the short path. Cold starts and rejected seeds retain two full windows.
+For the recent clean startup, this targets internal lock about 32 seconds after
+PTP service opens, rather than 64 seconds; hardware validation is required.
+
+### Advertised startup quality
+
+No PTP service is sent before startup phase verification completes. Once it
+opens, acquisition advertises class 248, accuracy 0xFE (unknown), unknown
+variance and internal-oscillator time source, without traceability flags.
+Internal LOCK starts the existing 30-second settling period: class 7 while the
+estimated error is <=100 us, or class 187 when unknown/above that threshold.
+After settling, stable LOCK advertises class 6, GNSS source and time/frequency
+traceability. The settling period also applies to the first lock.
+
+Accuracy is separately mapped from the software error estimate. During clean
+LOCK it has a 1 us minimum allowance (code 0x23); larger observed phase errors
+can select a coarser accuracy code. The estimate does not establish an absolute
+UTC calibration bound. Variance stays unknown until sufficient quality samples
+have accumulated, and is advertised only in class 6. UTC offset validity and
+PTP timescale flags are set whenever the service is sending Announce messages.
+
+If a missing/poor seed accumulates more than 200 us during a full fit, startup
+coarse-aligns that large error once with PTP still disabled, then uses the fine
+slew on fresh PPS measurements to remove residual write latency. This prevents
+millisecond cold-start errors from repeatedly hitting the fine-slew guard.
+The first large epoch setting and this conditional large-error alignment are
+the only startup absolute-time writes; the redundant preliminary rewrite is
+gone. Hardware validation is still required for actual service-enable timing.
+
+The paragraphs below describe the earlier 32-sample/two-second startup trial;
+the updated thresholds and sequence above take precedence.
+
+After the first clean frequency fit, startup sets the base ppb correction to
+the current adjustment minus measured drift. It no longer rewrites absolute
+PHC time at this point. Instead `STARTUP_PHASE` updates a separate temporary
+correction on each clean, confirmed PPS: `extra_ppb = -phase_ns / 2`, limited
+to +/-20,000 ppb (20 ppm), with total output limited to +/-500,000 ppb.
+Only the startup stage bypasses the normal locked-servo 100 ppb/s slew limit.
+
+The PTP service gate stays closed. Once phase enters +/-500 ns, startup removes
+the temporary correction and requires three subsequent consecutive clean PPS
+samples inside that band at the base rate before opening the service gate.
+Changing-rate samples never enter the 32-second frequency-fit windows. Normal
+acquisition frequency verification then resumes with fresh buffers; clockClass
+does not claim full LOCK until the existing phase/frequency tests pass. The
+locked PI gains and saved-frequency format are unchanged. NVS remains eligible
+only during stable LOCK, so startup corrections cannot be persisted.
+
+Loss of fix/labels, dirty PPS samples, missing samples or a MAC restart requests
+base-rate restoration before any more acquisition work. A failed restore is
+retried; service stays disabled. The startup helper also guards against phase
+over +/-200 us, sample spacing outside 0.5–1.5 seconds, and more than 30 seconds
+of startup slewing. Those failures restore base and restart acquisition. These
+are bounded safety guards, not an unconditional promise of startup time.
+
+`STARTUP_PHASE begin` reports the fitted drift and base rate. Per-PPS lines show
+phase, base, temporary extra, actual command, and base-rate verification count.
+`PTP service enabled after startup phase verification` identifies the handoff.
+The first ~32-second frequency fit is still required. Ideal 32–38 us phase
+errors converge in roughly 10–11 additional PPS samples; confirm actual timing
+and stability on hardware with the webpage load unchanged.
+
+`tools/test-startup-slew.c` covers positive/negative phase, residual frequency
+error, zero phase, clipping, verification reset, missing samples and timeout.
+The cross compiler evaluates these deterministic vectors to a constant-success
+test program at -O3. This is a software regression check, not a hardware test.
+
+## Date-jump diagnostics and protection
+
+After two fresh labels establish the PPS epoch, the last confirmed NMEA UTC
+second and its UART monotonic arrival time anchor a continuity check. RMC and
+ZDA are checked independently before updating GNSS time or queuing labels.
+They must agree with the monotonic projection within 2 seconds, plus a 1000 ppm
+allowance for clock drift across a prolonged GNSS outage. No build date or PHC
+absolute time is used. This cannot identify a consistently wrong date at boot.
+
+`GNSS_DATE` prints the first rejected date and at most one repeat per source
+every 10 seconds. Diagnostics include checksum verification, parsed/expected
+Unix UTC seconds, displacement in seconds and whole weeks/remainder, monotonic
+arrival and anchor timestamps, per-source event/lifetime bad-sentence counts,
+and checksum-failure counts. The first event also prints the preceding full
+RMC and ZDA sentences with their recorded checksum/parser results. The current
+rejected sentence retains its original checksum bytes. A `RECOVER` line gives
+duration, counts and the returning valid raw sentence. Counts are per UART
+sentence, not per PPS. All output stays outside the ISR.
+
+Suspect dates do not refresh GNSS time or PPS labels. Existing bounded coasting
+and then holdover preserve frequency until consistent dates return. As a
+second defense, the locked servo rejects offsets larger than one second before
+any averaging/integration, including filter warm-up, preventing the overflow
+seen with the 2048-week date jump. It preserves frequency and filters.
+
+Routine Delay_Req receive summaries now aggregate over 60 seconds, configurable
+with `PTP_RX_LOG_INTERVAL_MS`; send errors and other warnings remain enabled.
+`tools/test-gnss-epoch.c` contains standalone regression cases for startup,
+normal progression, the observed 44-second 2048-week excursion, recovery,
+fractional timing/leap-second allowance, reverse-era jumps and long outages.
+
 Current capture path: the GPIO ISR performs a raw, direct-register snapshot
 and publishes it to a 32-record single-producer/single-consumer queue. It saves
 the ETM latch, captures timer entry time, reads PHC control/seconds, brackets

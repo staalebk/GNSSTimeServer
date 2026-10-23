@@ -122,7 +122,17 @@ Everything below is organized by capability, comparing the two builds side by si
 
 - **Best Master Clock Algorithm (BMCA)** with full priority1 / clockClass / accuracy / variance / priority2 / clockIdentity ordering, so multiple grandmasters can coexist and fail over gracefully.
 - A **stability filter** that requires 3 consecutive Announces from the same candidate before changing roles, and a **6-second announce timeout** before reclaiming the master role, together giving the master role a clean hysteresis that shields downstream slaves from needless flapping.
-- **Dynamic clock quality** advertising: clockClass 6 / accuracy 0x21 when locked, 7 / 0x23 in holdover, with a 30-second post-holdover settling window so recovering slaves don't rail their servos against a still-settling master.
+- **Dynamic clock quality**: class 6 when settled and locked; class 7 during in-budget holdover/settling; class 187 once estimated error exceeds the local 100 us holdover budget. Accuracy follows the estimated error instead of fixed locked/holdover categories. Recovery retains the 30-second settling window.
+
+Clock quality estimation (`Master/main/clock_quality.h`):
+
+- PTP variance uses consecutive, clean, accepted, locked GNSS phase samples at one-second intervals: mean squared second phase difference / 6, converted from ns² to s² and encoded as `32768 + 256*log2(PTPVAR)`. It requires 256 differences, retains the latest 1024, and applies one log2 unit of reporting hysteresis. Gaps/acquisition/holdover reset the estimator; unknown variance is `0xFFFF`. Announce and the local BMCA dataset use the same results. PPS/capture noise is included; this is not a measurement of network delivery accuracy.
+- Holdover training retains up to 1440 minute points in RAM, expires data older than 24 hours, and resets at reboot. It integrates the actual hardware correction and uses phase differences to reconstruct errors if that correction had instead been frozen. Non-overlapping endpoint trials cover 60, 300, 900, and 3600 seconds; gaps never form trials. No flash writes are added.
+- A horizon needs 30 trials before it can replace the fallback. The model uses twice the largest observed error per second, with a 100 ppb minimum, and takes the worst qualified rate across horizons. Beyond the longest qualified horizon it uses at least 1000 ppb. Consequently a one-day window cannot qualify the one-hour horizon; long outages retain the fallback. These are engineering margins, not confidence bounds or guaranteed oscillator specifications.
+- Estimated holdover error adds an initial allowance of at least 5 us to elapsed seconds times the modeled rate. Aging starts at the last accepted GNSS sample, including loss-detection latency. Frequency updates freeze during holdover. At the fallback rate, the 100 us class-7 budget expires after at most 95 seconds. `CQ_HOLDOVER_SPEC_NS`, fallback rate, and margins require validation against real disconnect and temperature tests. Class 187 continues serving subject to BMCA. Unknown/saturated accuracy is advertised as `0xFE`.
+- `/api/status` exposes `offset_scaled_log_variance`, `estimated_error_ns`, `quality_history_minutes`, `estimated_holdover_60s_ns`, and `estimated_holdover_1h_ns`. Error values use `4294967295` as unknown/saturated; forecast fields are zero before the first training sample. `CLOCK_QUALITY` logs include trial counts once per minute while training. Forecasts and history counters describe the latest training result; only current error ages during an outage.
+
+Numerical regression tests: `cc -std=c11 -O2 -Wall -Wextra -Werror Master/tools/test-clock-quality.c -lm -o test-clock-quality`, then run the executable. Tests cover the IEEE encoding example, phase second differences, missed samples, constant-correction cancellation, correction changes, fallback horizons, and history expiry.
 - **Slave tracking**, up to 8 simultaneous slave clock IDs with a 30-second activity timeout.
 
 ### 🛡️ Holdover & resilience
@@ -195,6 +205,57 @@ Libraries:
   olikraus/U8g2           @ ^2.36.19
   mkfrey/u8g2-hal-esp-idf @ ^v3-compat
 ```
+
+### Choosing the PTP transport
+
+Open **Settings** from the dashboard (`/settings`). The page has two sections:
+
+- **System:** hostname, DHCP with static fallback, static IPv4, or DHCP only;
+  static/fallback address, subnet mask and gateway; reboot; clear the learned
+  PPS frequency seed and reboot.
+- **PTP:** Layer-2 or UDP/IPv4 transport, domain, priorities 1 and 2, Sync
+  interval (125 ms to 8 s) and Announce interval (125 ms to 16 s). Announce
+  must be at least as long as Sync. Clock class and accuracy stay automatic.
+
+**Save settings** commits a versioned blob to the `device_cfg` NVS namespace.
+The page shows saved values; the dashboard shows the currently running values.
+Reboot applies saved settings. Invalid or missing settings use firmware defaults;
+NVS initialization failures never trigger a partition erase. Hostname can be blank
+for a MAC-derived name. Changing the network configuration may require reconnecting
+at a new address. DHCP-only mode has no static recovery address.
+
+The GNSS receiver already runs its position survey at every boot after a stable
+fix (up to 15 minutes). Reboot after moving the antenna to repeat configuration
+and surveying. Receiver configuration remains in RAM, as before.
+
+Clearing the PPS seed erases only `ptp_freq/learned`, prevents the background
+saver from recreating it before reboot, and leaves settings intact. Normal learning
+and persistence resume on the next boot.
+
+The build flag `-DPTP_TRANSPORT_UDP_IPV4=ON` selects the default for devices
+without saved settings (OFF defaults to Layer-2). Saved NVS settings take precedence.
+Only one transport runs per boot. The transmitted logMessageInterval values and
+status/health reports follow the selected cadence. Configure clients for the same
+transport/domain and an appropriate Announce timeout.
+
+UDP mode uses PTPv2 E2E, multicast group `224.0.1.129`, event port 319,
+general port 320, and multicast TTL 1. It needs an assigned IPv4 address
+(DHCP, configured static address, or static fallback). IPv6, peer delay, unicast negotiation, and VLAN-tagged
+PTP are outside this implementation.
+
+An Ethernet receive callback validates and routes matching UDP PTP frames
+to the timestamp-enabled L2TAP queue. All other traffic goes directly to
+lwIP, keeping DHCP and the web server independent of the PTP queue.
+IGMP membership is maintained through lwIP for multicast snooping switches.
+Hardware IPv4 PTP parsing is enabled at initialization and after PHC restart.
+UDP Sync without a hardware TX timestamp suppresses its Follow_Up;
+Delay_Req without a hardware RX timestamp is discarded.
+
+Before deployment, verify with a hardware-timestamping UDP client (for
+example, Linux `ptp4l -i eth0 -4 -E -m -s`), inspect Sync/Follow_Up and
+Delay_Req/Delay_Resp in a packet capture, and check the web server and
+multicast reception after cable reconnection. Compilation alone does not
+verify hardware timestamp capture or achieved synchronization accuracy.
 
 ### Running the PTP grandmaster without a screen
 
@@ -289,4 +350,6 @@ The NTP/RDATE server stands on the shoulders of [w8bh.net](http://w8bh.net/avr/c
 
 73 📻
 
-The Master overview includes timing history below Time reference: 60 seconds at 1-second resolution, one hour at 1-minute resolution, and 24 hours at 15-minute resolution. Each interval retains the worst sampled servo status and the minimum/maximum applied frequency adjustment (ppb). Sampling runs on the device every second, even with no browser connected. History is kept in RAM, resets at reboot, and is available through GET /api/history; empty intervals appear as gaps. Status severity increases from Locked to Acquiring, Holdover, No link, and Fault/unknown. The newest interval is partial.
+The Master overview includes timing history below Time reference: 60 seconds at 1-second resolution, five minutes at 5-second resolution, and 24 hours at 15-minute resolution. Each interval retains the worst sampled servo status and the minimum/maximum applied frequency adjustment (ppb). Sampling runs on the device every second, even with no browser connected. History is kept in RAM, resets at reboot, and is available through GET /api/history; empty intervals appear as gaps. Status severity increases from Locked to Acquiring, Holdover, No link, and Fault/unknown. The newest interval is partial.
+
+GNSS history below Timing history uses the same three resolutions. Satellite counts retain interval minimum/maximum for in-view and in-use counts. Signal C/N0 retains minimum, maximum, and the observation-weighted average of fresh positive reports sampled every second. Reports older than 10 seconds and missing signal values are excluded; absent measurements appear as gaps. History resets on reboot.
